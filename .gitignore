@@ -1,0 +1,16 @@
+# CopySecureFast .gitignore
+# ──────────────────────────────────────────────
+# Rust / cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+# Python (para más adelante)
+/__pycache__/
+*.py[cod]
+# Entornos / IDE
+.venv/
+.vscode/
+.idea/
+# Sistema
+*.swp
+.DS_Store
