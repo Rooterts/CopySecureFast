@@ -60,13 +60,15 @@
     <video-files/>
   </action>
 
-  <!-- Pegar con CSF: encola los items del clipboard en esta carpeta -->
+  <!-- Pegar con CSF: encola los items del clipboard en esta carpeta.
+       Usa %d (current directory de Thunar) para que funcione tanto al
+       click derecho en el fondo como sobre un item de la carpeta. -->
   <action>
     <icon>edit-paste</icon>
     <name>Pegar con CopySecureFast</name>
     <unique-id>csf-paste</unique-id>
     <description>Encolar copia/move de los items marcados en esta carpeta</description>
-    <command>sh -c 'csf-thunar-helper paste "$1" || notify-send "CopySecureFast" "Clipboard CSF vacío"' sh %f</command>
+    <command>sh -c 'csf-thunar-helper paste "$1" || notify-send "CopySecureFast" "Clipboard CSF vacío"' sh %d</command>
     <patterns>*</patterns>
     <directories/>
   </action>

@@ -319,6 +319,7 @@ fn control_job(
 }
 
 fn enqueue_items(db: &QueueDb, items: &[EnqueueItem]) -> Result<usize, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -326,81 +327,30 @@ fn enqueue_items(db: &QueueDb, items: &[EnqueueItem]) -> Result<usize, String> {
 
     let mut count = 0;
     for it in items {
-        let src_str = it.source.to_string_lossy().to_string();
-        let dest_str = it.dest.to_string_lossy().to_string();
-        let expanded = expand_paths(
-            std::path::Path::new(&src_str),
-            std::path::Path::new(&dest_str),
-            it.op,
-            it.verify_hash,
-            now,
-        );
-        for job in expanded {
-            db.insert_job(&job).map_err(|e| e.to_string())?;
-            count += 1;
+        // Validar que source existe.
+        if !it.source.exists() {
+            return Err(format!("source no existe: {}", it.source.display()));
         }
-    }
-    Ok(count)
-}
-
-/// Expande una ruta en uno o más JobItem. Calcula correctamente el
-/// destino para cada item expandido, manteniendo la estructura
-/// de directorios si el origen es una carpeta.
-///
-/// Reglas:
-/// - Si `dest` existe y es directorio, el archivo se copia a `dest/<basename>`.
-/// - Si `dest` no existe y el `source` es archivo: el destino se
-///   interpreta como "rename" (archivo destino exacto).
-/// - Si el `source` es directorio: se itera recursivamente y cada
-///   archivo termina en `dest/<ruta_relativa>`, creando subdirectorios
-///   según sea necesario (esto último no se hace en este spike, queda
-///   como mejora futura — por ahora los archivos de subcarpetas van
-///   todos a `dest/` con su basename).
-fn expand_paths(
-    source: &std::path::Path,
-    dest: &std::path::Path,
-    op: Operation,
-    verify_hash: bool,
-    now: i64,
-) -> Vec<JobItem> {
-    let mut out = Vec::new();
-
-    if source.is_file() {
-        // Calcular el destino real respetando "dest es dir" vs "dest es archivo"
-        let real_dest = if dest.is_dir() {
-            dest.join(source.file_name().unwrap_or_default())
-        } else {
-            dest.to_path_buf()
-        };
-        let total_bytes = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
-        out.push(JobItem {
-            id: Uuid::new_v4().to_string(),
-            source: source.to_path_buf(),
-            dest: real_dest,
-            op,
-            state: JobState::Pending,
+        // total_bytes conocido al encolar.
+        let total_bytes = std::fs::metadata(&it.source).map(|m| m.len()).unwrap_or(0);
+        let job = JobItem {
+            id: uuid::Uuid::new_v4().to_string(),
+            source: it.source.clone(),
+            dest: it.dest.clone(),
+            op: it.op,
+            state: Default::default(),
             total_bytes,
             copied_bytes: 0,
             hash: None,
             enqueued_at: now,
             finished_at: 0,
             error: None,
-            verify_hash,
-        });
-    } else if source.is_dir() {
-        // Expandir recursivamente
-        if let Ok(rd) = std::fs::read_dir(source) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.is_file() {
-                    out.extend(expand_paths(&p, dest, op, verify_hash, now));
-                } else if p.is_dir() {
-                    out.extend(expand_paths(&p, dest, op, verify_hash, now));
-                }
-            }
-        }
+            verify_hash: it.verify_hash,
+        };
+        db.insert_job(&job).map_err(|e| e.to_string())?;
+        count += 1;
     }
-    out
+    Ok(count)
 }
 
 /// Worker loop: cada 200ms revisa la cola, procesa un job pending,

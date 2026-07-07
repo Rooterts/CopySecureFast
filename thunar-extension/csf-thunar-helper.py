@@ -84,10 +84,9 @@ def _save_clipboard(op: str, items: list[str]) -> None:
 def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list[str]) -> int:
     """Encola cada source como un job apuntando a dest.
 
-    - Si `dest` es un directorio existente (o no existe pero su parent sí),
-      cada source va a `dest/<basename>`. Si hay colisión, se renombra.
-    - Si `dest` no existe, el primer source va a dest y los demás se
-      descartan con warning (modo "rename").
+    Si el source es un directorio, expande recursivamente y crea un job
+    por archivo (cada uno con destino = <dest>/<basename_directorio>/<ruta_rel>).
+    Si el source es un archivo y dest es directorio, va a <dest>/<basename>.
     """
     dest_path = Path(dest)
     items: list[EnqueueItem] = []
@@ -98,18 +97,25 @@ def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list
             if not src.exists():
                 print(f"aviso: {src} no existe; se omite", file=sys.stderr)
                 continue
-            target = dest_path / src.name
-            if target.exists() or target.resolve() == src.resolve():
-                # Colisión: renombrar a "name (1).ext", "name (2).ext"...
-                stem, suffix = target.stem, target.suffix
-                for i in range(1, 1000):
-                    candidate = dest_path / f"{stem} ({i}){suffix}"
-                    if not candidate.exists():
-                        target = candidate
-                        break
-            items.append(EnqueueItem(str(src), str(target), op))
+            if src.is_file():
+                target = dest_path / src.name
+                if target.exists() or target.resolve() == src.resolve():
+                    stem, suffix = target.stem, target.suffix
+                    for i in range(1, 1000):
+                        candidate = dest_path / f"{stem} ({i}){suffix}"
+                        if not candidate.exists():
+                            target = candidate
+                            break
+                items.append(EnqueueItem(str(src), str(target), op))
+            elif src.is_dir():
+                # Expandir recursivamente: cada archivo va a
+                # <dest>/<basename_src>/<ruta_relativa>
+                subdir = dest_path / src.name
+                for child in _walk_files(src):
+                    rel = child.relative_to(src)
+                    target = subdir / rel
+                    items.append(EnqueueItem(str(child), str(target), op))
     else:
-        # Modo rename: solo el primer source
         if len(sources) > 1:
             print(
                 f"aviso: destino {dest} no es directorio; solo el primero de {len(sources)}",
@@ -120,13 +126,24 @@ def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list
             if not src.exists():
                 print(f"aviso: {src} no existe", file=sys.stderr)
                 return 0
-            items.append(EnqueueItem(str(src), dest, op))
+            if src.is_dir():
+                # Modo rename: copia la carpeta entera al destino
+                items.append(EnqueueItem(str(src), dest, op))
+            else:
+                items.append(EnqueueItem(str(src), dest, op))
 
     if not items:
         return 0
     n = client.enqueue(items)
     print(f"csfd: encolados {n} jobs ({op.value})")
     return n
+
+
+def _walk_files(root: Path):
+    """Itera recursivamente sobre todos los archivos bajo `root`."""
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            yield p
 
 
 def _notify_tray_show() -> None:

@@ -148,8 +148,17 @@ impl CopyOp {
         verify_hash: bool,
         signal: &Arc<AtomicU8>,
     ) -> Result<(), Signal> {
+        let dst_ref = dst.as_ref();
+        // Crear directorio padre si no existe (caso "pegar carpeta")
+        if let Some(parent) = dst_ref.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return Err(Signal::Io(e));
+                }
+            }
+        }
         let mut src_f = File::open(src.as_ref()).map_err(Signal::Io)?;
-        let mut dst_f = File::create(dst.as_ref()).map_err(Signal::Io)?;
+        let mut dst_f = File::create(dst_ref).map_err(Signal::Io)?;
         let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
         let mut hasher = if verify_hash {
             Some(Sha256::new())
