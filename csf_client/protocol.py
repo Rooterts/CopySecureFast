@@ -1,31 +1,31 @@
-"""Tipos de mensajes del protocolo csfd.
+"""Message types for the csfd protocol.
 
-Espejo de `daemon/src/types.rs`. Mantener ambos sincronizados.
+Mirror of `daemon/src/types.rs`. Keep both in sync.
 
-Convenciones de serde aplicadas:
-- `Operation` y `JobState` son enums con `#[serde(rename_all = "lowercase")]`
-  → en JSON van en minúsculas: "copy", "pending", etc.
-- `Request` y `Response` usan tag interno (`method` / `event`).
-- Eventos espontáneos del server tienen tag `event` (job_started,
+serde conventions applied:
+- `Operation` and `JobState` enums use `#[serde(rename_all = "lowercase")]`
+  -> JSON uses lowercase: "copy", "pending", etc.
+- `Request` and `Response` use an internal tag (`method` / `event`).
+- Spontaneous events from the server have a tag `event` (job_started,
   job_progress, job_completed, etc).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
 
 class Operation(str, Enum):
-    """Tipo de operación de un job."""
+    """Type of operation for a job."""
 
     COPY = "copy"
     MOVE = "move"
 
 
 class JobState(str, Enum):
-    """Estado de un job en la cola."""
+    """State of a job in the queue."""
 
     PENDING = "pending"
     RUNNING = "running"
@@ -53,7 +53,7 @@ class JobState(str, Enum):
 
 @dataclass
 class EnqueueItem:
-    """Petición de encolar una operación de copia/move."""
+    """Request to enqueue a copy/move operation."""
 
     source: str
     dest: str
@@ -71,7 +71,7 @@ class EnqueueItem:
 
 @dataclass
 class JobItem:
-    """Un job individual en la cola. Refleja `daemon::types::JobItem`."""
+    """A single job in the queue. Mirrors `daemon::types::JobItem`."""
 
     id: str
     source: str
@@ -119,7 +119,7 @@ class JobItem:
 
 
 # ─────────────────────────────────────────────────────────────────
-# Eventos espontáneos del server (streaming)
+# Spontaneous events from the server (streaming)
 # ─────────────────────────────────────────────────────────────────
 @dataclass
 class JobStarted:
@@ -172,7 +172,7 @@ ServerEvent = (
 
 
 def parse_event(data: dict) -> Optional[ServerEvent]:
-    """Parsea un mensaje del server. Devuelve None si no es un evento válido."""
+    """Parses a server message. Returns None if it isn't a valid event."""
     event = data.get("event")
     payload = data.get("data", {})
     if event == "job_started":

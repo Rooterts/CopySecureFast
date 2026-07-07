@@ -1,14 +1,13 @@
-//! Motor de copia/movimiento de archivos individuales.
+//! File copy/move engine for individual files.
 //!
-//! Características del spike actual:
-//! - Streaming con buffer 128 KiB.
-//! - Hash SHA-256 opcional en la misma pasada (no relee el archivo).
-//! - Move: usa `fs::rename`; fallback a copy+unlink si rename falla
-//!   (cross-device).
-//! - **Pausa/cancelación cooperativa**: chequea un `Arc<AtomicU8>` cada
-//!   bloque. 0 = continuar, 1 = pausar, 2 = cancelar.
-//! - Preserva permisos del origen (best effort).
-//! - Reporta bytes copiados en `job.copied_bytes` durante la operación.
+//! Features of the current spike:
+//! - Streaming with 128 KiB buffer.
+//! - Optional SHA-256 hash in the same pass (no second read of the file).
+//! - Move: uses `fs::rename`; falls back to copy+unlink on cross-device.
+//! - **Cooperative pause/cancel**: checks an `Arc<AtomicU8>` every
+//!   block. 0 = run, 1 = pause, 2 = cancel.
+//! - Preserves source permissions (best effort).
+//! - Reports copied bytes in `job.copied_bytes` during the operation.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -25,7 +24,7 @@ use crate::types::{JobItem, JobState, Operation};
 const COPY_BUFFER_SIZE: usize = 128 * 1024;
 const CHECK_SIGNAL_EVERY_MS: u128 = 80;
 
-/// Códigos de señal atómica para controlar un job en curso.
+/// Atomic signal codes for controlling an in-flight job.
 pub const SIGNAL_RUN: u8 = 0;
 pub const SIGNAL_PAUSE: u8 = 1;
 pub const SIGNAL_CANCEL: u8 = 2;
@@ -33,12 +32,12 @@ pub const SIGNAL_CANCEL: u8 = 2;
 pub struct CopyOp;
 
 impl CopyOp {
-    /// Ejecuta la copia o movimiento del archivo del job.
+    /// Runs the copy or move of the file in `job`.
     ///
-    /// `signal` es compartido con el RPC server: si el usuario pausa
-    /// o cancela, el server cambia el valor y el job reacciona.
+    /// `signal` is shared with the RPC server: if the user pauses or
+    /// cancels, the server changes the value and the job reacts.
     ///
-    /// Devuelve el job actualizado con el estado final.
+    /// Returns the job updated with its final state.
     pub fn run(job: &mut JobItem, signal: Arc<AtomicU8>) {
         let verify_hash = job.verify_hash;
 
@@ -46,7 +45,7 @@ impl CopyOp {
             job.total_bytes = Self::file_size(&job.source);
         }
 
-        // Si ya estaba cancelado antes de empezar, no hacer nada.
+        // If already cancelled before we start, exit early.
         if signal.load(Ordering::Relaxed) == SIGNAL_CANCEL {
             job.state = JobState::Cancelled;
             job.finished_at = now_secs();
@@ -65,15 +64,15 @@ impl CopyOp {
                         info!(job_id = %job.id, "copy completed");
                     }
                     Err(Signal::Cancelled) => {
-                        // Borrar el archivo parcial para no dejar basura.
+                        // Clean up the partial file so we don't leave garbage.
                         let _ = fs::remove_file(&dest);
                         job.state = JobState::Cancelled;
                         job.finished_at = now_secs();
                         info!(job_id = %job.id, "copy cancelled");
                     }
                     Err(Signal::Paused) => {
-                        // No borramos el archivo parcial: al reanudar, el
-                        // worker debería detectar el estado y seguir.
+                        // Don't delete the partial: on resume the worker
+                        // should pick it up from where it left off.
                         job.state = JobState::Paused;
                         info!(job_id = %job.id, "copy paused at {} bytes", job.copied_bytes);
                     }
@@ -97,8 +96,8 @@ impl CopyOp {
                     );
                     match Self::copy_file(&source, &dest, job, verify_hash, &signal) {
                         Ok(()) => {
-                            // Si fue cancelado durante la copia, no borrar
-                            // el origen (puede haber fallado parcialmente).
+                            // If cancelled during the copy, don't delete
+                            // the source (may have failed partially).
                             if job.state == JobState::Cancelled {
                                 job.finished_at = now_secs();
                                 return;
@@ -137,6 +136,7 @@ impl CopyOp {
         }
     }
 
+    /// File size in bytes, 0 if it cannot be read.
     pub fn file_size(path: &Path) -> u64 {
         fs::metadata(path).map(|m| m.len()).unwrap_or(0)
     }
@@ -149,7 +149,7 @@ impl CopyOp {
         signal: &Arc<AtomicU8>,
     ) -> Result<(), Signal> {
         let dst_ref = dst.as_ref();
-        // Crear directorio padre si no existe (caso "pegar carpeta")
+        // Create parent directory if it doesn't exist (case "paste folder").
         if let Some(parent) = dst_ref.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -168,9 +168,9 @@ impl CopyOp {
         let mut last_check = std::time::Instant::now();
 
         loop {
-            // Chequeo de señal cada ~80ms. Más rápido = más responsivo
-            // a pausa/cancel, pero más overhead. 80ms es invisible al
-            // usuario y permite reaccionar en archivos chicos.
+            // Check the signal every ~80ms. Faster = more responsive to
+            // pause/cancel but more overhead. 80ms is invisible to the
+            // user and reacts in time even for small files.
             if last_check.elapsed().as_millis() >= CHECK_SIGNAL_EVERY_MS {
                 match signal.load(Ordering::Relaxed) {
                     SIGNAL_CANCEL => return Err(Signal::Cancelled),
@@ -190,6 +190,7 @@ impl CopyOp {
             dst_f.write_all(&buffer[..n]).map_err(Signal::Io)?;
             job.copied_bytes = job.copied_bytes.saturating_add(n as u64);
 
+            // Mark as running as soon as we start copying.
             if job.state == JobState::Pending {
                 job.state = JobState::Running;
             }
@@ -206,14 +207,15 @@ impl CopyOp {
             );
         }
 
+        // Preserve source permissions (best effort).
         if let Ok(meta) = fs::metadata(src.as_ref()) {
-            let _ = fs::set_permissions(dst.as_ref(), meta.permissions());
+            let _ = fs::set_permissions(dst_ref, meta.permissions());
         }
         Ok(())
     }
 }
 
-/// Salida de una copia: éxito, error de I/O, pausa o cancelación.
+/// Outcome of a copy: success, I/O error, paused or cancelled.
 #[derive(Debug)]
 pub enum Signal {
     Io(std::io::Error),
@@ -241,7 +243,6 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU8;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now() -> i64 {
@@ -278,7 +279,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.txt");
         let dst = dir.join("dst.txt");
-        let payload = b"hello world 12345 -- payload de prueba CopySecureFast";
+        let payload = b"hello world 12345 -- CopySecureFast test payload";
         std::fs::write(&src, payload).unwrap();
 
         let mut job = make_job(src.clone(), dst.clone(), Operation::Copy);
@@ -299,6 +300,7 @@ mod tests {
         let dst = dir.join("dst.txt");
         std::fs::write(&src, b"abc").unwrap();
 
+        // SHA-256("abc") = ba7816bf...
         let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         let mut job = make_job(src, dst, Operation::Copy);
         job.verify_hash = true;
@@ -314,7 +316,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.txt");
         let dst = dir.join("dst.txt");
-        std::fs::write(&src, b"contenido a mover").unwrap();
+        std::fs::write(&src, b"content to move").unwrap();
 
         let mut job = make_job(src.clone(), dst.clone(), Operation::Move);
         CopyOp::run(&mut job, sig());
@@ -344,18 +346,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("src.txt");
         let dst = dir.join("dst.txt");
-        // Payload grande para que la copia tarde más de un bloque.
+        // Large enough payload so the copy takes more than one block.
         let payload = vec![0xABu8; 5 * 1024 * 1024];
         std::fs::write(&src, &payload).unwrap();
 
         let s = sig();
-        // Cancelar antes de empezar.
+        // Cancel before starting.
         s.store(SIGNAL_CANCEL, Ordering::Relaxed);
 
         let mut job = make_job(src, dst.clone(), Operation::Copy);
         CopyOp::run(&mut job, s);
 
         assert_eq!(job.state, JobState::Cancelled);
-        assert!(!dst.exists(), "el archivo parcial debe haberse borrado");
+        assert!(!dst.exists(), "the partial file must be removed");
     }
 }

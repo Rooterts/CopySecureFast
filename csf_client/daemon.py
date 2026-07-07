@@ -1,23 +1,23 @@
-"""Cliente JSON-RPC del daemon csfd.
+"""JSON-RPC client for the csfd daemon.
 
-API principal:
+Main API:
     >>> from csf_client import DaemonClient, EnqueueItem, Operation
     >>> with DaemonClient() as c:
     ...     c.ping()
     ...     c.enqueue([EnqueueItem("/a", "/b", Operation.COPY)])
-    ...     c.pause()           # pausa todos
-    ...     c.pause(job_id="x") # pausa uno
+    ...     c.pause()           # pause all
+    ...     c.pause(job_id="x") # pause one
     ...     for ev in c.subscribe():
     ...         print(ev)
 
-Conexión:
-- Socket Unix en `$XDG_RUNTIME_DIR/copysecurefast.sock` por defecto.
-- Override con env `CSF_SOCKET` o argumento `socket_path`.
-- Si el daemon no está corriendo, lanza `DaemonConnectionError`.
-- Reconexión lazy: si la conexión se cae, la siguiente llamada reabre.
+Connection:
+- Unix socket at `$XDG_RUNTIME_DIR/copysecurefast.sock` by default.
+- Override with env `CSF_SOCKET` or the `socket_path` argument.
+- Raises `DaemonConnectionError` if the daemon is not running.
+- Lazy reconnect: if the connection drops, the next call reopens it.
 
-Thread-safety: el cliente no es thread-safe. Para uso desde múltiples
-hilos usar un cliente por hilo, o agregar un lock externo.
+Thread safety: not thread-safe. Use one client per thread, or add an
+external lock.
 """
 
 from __future__ import annotations
@@ -51,9 +51,9 @@ DEFAULT_RECV_TIMEOUT_S = 5.0
 
 
 def _default_socket_path() -> str:
-    """Resuelve el path del socket.
+    """Resolves the socket path.
 
-    Prioridad:
+    Priority:
     1. Env `CSF_SOCKET`
     2. `$XDG_RUNTIME_DIR/copysecurefast.sock`
     3. `/run/user/<uid>/copysecurefast.sock`
@@ -69,13 +69,13 @@ def _default_socket_path() -> str:
 
 
 class DaemonClient(AbstractContextManager):
-    """Cliente del daemon csfd. Usar como context manager o directamente.
+    """Client for the csfd daemon. Use as a context manager or directly.
 
-    El cliente mantiene UNA conexión long-lived con el daemon. Cuando
-    llamás a métodos como `ping` o `enqueue`, envía un request y lee
-    la respuesta de la línea siguiente. Los eventos espontáneos del
-    daemon (job_started, job_progress, etc.) se leen en background
-    y se encolan en una cola interna accesible vía `subscribe()`.
+    The client keeps a single long-lived connection to the daemon.
+    Methods like `ping` or `enqueue` send a request and read the next
+    line as the response. Spontaneous events (job_started, job_progress,
+    etc.) are read in the background and queued in an internal `queue.Queue`
+    accessible via `subscribe()`.
     """
 
     def __init__(
@@ -88,12 +88,12 @@ class DaemonClient(AbstractContextManager):
         self.recv_timeout = recv_timeout
         self.auto_reconnect = auto_reconnect
         self._sock: Optional[socket.socket] = None
-        # Cola thread-safe para eventos espontáneos del server.
+        # Thread-safe queue for events read off the socket.
         self._events: "queue.Queue[ServerEvent]" = queue.Queue()
+        # The reader thread also pushes raw response dicts so request/response
+        # correlation works over the same connection.
         self._reader_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
-        # Para correlacionar responses con requests, el server responde
-        # en orden FIFO por conexión. No necesitamos IDs en este spike.
 
     # ── context manager ──────────────────────────────────────────────
     def __enter__(self) -> "DaemonClient":
@@ -111,13 +111,13 @@ class DaemonClient(AbstractContextManager):
 
     # ── lifecycle ────────────────────────────────────────────────────
     def connect(self) -> None:
-        """Abre el socket Unix. Lanza DaemonConnectionError si falla."""
+        """Opens the Unix socket. Raises DaemonConnectionError on failure."""
         if self._sock is not None:
             return
         if not os.path.exists(self.socket_path):
             raise DaemonConnectionError(
-                f"socket no encontrado: {self.socket_path} "
-                f"(¿daemon csfd corriendo? Probá `csfd` en otra terminal)"
+                f"socket not found: {self.socket_path} "
+                f"(is the csfd daemon running? Try `csfd` in another terminal)"
             )
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -127,13 +127,12 @@ class DaemonClient(AbstractContextManager):
             self._start_reader()
         except OSError as e:
             raise DaemonConnectionError(
-                f"no se pudo conectar a {self.socket_path}: {e}"
+                f"could not connect to {self.socket_path}: {e}"
             ) from e
 
     def close(self) -> None:
         self._stop.set()
         if self._reader_thread is not None:
-            # El reader termina cuando el socket se cierre
             self._reader_thread.join(timeout=1.0)
             self._reader_thread = None
         if self._sock is not None:
@@ -153,13 +152,12 @@ class DaemonClient(AbstractContextManager):
 
     # ── reader thread ────────────────────────────────────────────────
     def _start_reader(self) -> None:
-        """Inicia un thread que lee líneas del socket y las dispatcha.
+        """Starts a background thread that reads lines from the socket.
 
-        La primera línea después de un request es su respuesta. Las
-        líneas siguientes, si llegaron espontáneamente, son eventos.
-        Para simplificar, el reader pone TODAS las líneas en la cola
-        de eventos, y los métodos request/response sacan la primera
-        línea como respuesta y devuelven el resto a la cola.
+        Lines that look like responses (have "event" with one of the
+        response names) are routed to the request/response correlator
+        (via a separate tuple queue). All other event lines are converted
+        to `ServerEvent` instances and pushed onto the events queue.
         """
         self._stop.clear()
 
@@ -174,11 +172,8 @@ class DaemonClient(AbstractContextManager):
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
-                        log.warning("línea no-JSON del daemon: %r", line)
+                        log.warning("non-JSON line from daemon: %r", line)
                         continue
-                    # Si tiene "method" o "event" con un id de response,
-                    # se procesa como respuesta. Si tiene "event" puro
-                    # (job_started, etc), es un evento.
                     if "event" in data and data["event"] not in (
                         "queue_snapshot", "pong", "enqueued", "error",
                     ):
@@ -186,13 +181,12 @@ class DaemonClient(AbstractContextManager):
                         if ev is not None:
                             self._events.put(ev)
                     else:
-                        # Es un response a un request previo. Encolamos
-                        # en una cola aparte y el método que espera
-                        # respuesta lo lee de ahí.
+                        # Response to a previous request: route via
+                        # a tagged tuple so the awaiting call picks it up.
                         self._events.put(("response", data))
             except (OSError, ValueError) as e:
                 if not self._stop.is_set():
-                    log.warning("reader terminado: %s", e)
+                    log.warning("reader terminated: %s", e)
             finally:
                 try:
                     f.close()
@@ -203,7 +197,11 @@ class DaemonClient(AbstractContextManager):
         self._reader_thread.start()
 
     def _send_and_await(self, method: str, params: Optional[dict] = None, timeout: float = 5.0) -> dict:
-        """Envía un request y espera la respuesta."""
+        """Sends a request and waits for the response."""
+        # Important: with serde's `#[serde(tag = "method", content = "params")]`,
+        # unit variants (like Ping) MUST NOT send a "params" key. Sending {}
+        # makes the daemon try to deserialize Ping { params: {} } which fails
+        # with "expected unit variant". Only add params if it has data.
         if params:
             msg = {"method": method, "params": params}
         else:
@@ -216,7 +214,7 @@ class DaemonClient(AbstractContextManager):
                     self.connect()
                 assert self._sock is not None
                 self._sock.sendall(payload)
-                # Esperar la siguiente respuesta (no evento)
+                # Wait for the next response (not event)
                 deadline = time.time() + timeout
                 while time.time() < deadline:
                     try:
@@ -225,18 +223,18 @@ class DaemonClient(AbstractContextManager):
                         continue
                     if isinstance(item, tuple) and item[0] == "response":
                         return item[1]
-                    # Si era un evento, reencolamos y seguimos esperando
+                    # It was an event, re-enqueue and keep waiting
                     self._events.put(item)
-                raise DaemonConnectionError("timeout esperando respuesta")
+                raise DaemonConnectionError("timeout waiting for response")
             except (OSError, DaemonConnectionError) as e:
                 self.close()
                 if attempt == 0 and self.auto_reconnect:
-                    log.warning("reconectando al daemon tras error: %s", e)
+                    log.warning("reconnecting to daemon after error: %s", e)
                     time.sleep(0.1)
                     continue
-                raise DaemonConnectionError(f"comunicación con daemon falló: {e}") from e
+                raise DaemonConnectionError(f"communication with daemon failed: {e}") from e
 
-    # ── API pública ──────────────────────────────────────────────────
+    # ── public API ──────────────────────────────────────────────────
     def ping(self) -> bool:
         resp = self._send_and_await("ping")
         return resp.get("event") == "pong"
@@ -258,10 +256,8 @@ class DaemonClient(AbstractContextManager):
         return int(data.get("global_speed_bps", 0))
 
     def pause(self, job_id: Optional[str] = None) -> int:
-        """Pausa un job (o todos). Devuelve cantidad afectada."""
+        """Pauses one job (or all if job_id is None). Returns the count affected."""
         resp = self._send_and_await("pause", {"job_id": job_id})
-        # El server devuelve un response "error" con el count en el message.
-        # En un futuro, agregaremos un Response::Paused dedicado.
         return self._extract_count(resp)
 
     def resume(self, job_id: Optional[str] = None) -> int:
@@ -273,21 +269,21 @@ class DaemonClient(AbstractContextManager):
         return self._extract_count(resp)
 
     def _extract_count(self, resp: dict) -> int:
-        # El server devuelve {"event": "error", "data": {"message": "..."}}
-        # con el count en el mensaje. Hacemos un parseo best-effort.
+        # The server currently returns a {"event": "error", "data": {"message": "..."}}
+        # reply for control actions, with the count embedded in the message.
+        # Best-effort parse until we add a dedicated response variant.
         msg = resp.get("data", {}).get("message", "")
-        # Buscar "N job(s)" en el mensaje
         import re
         m = re.search(r"(\d+)\s+job", msg)
         if m:
             return int(m.group(1))
         return 0
 
-    # ── Suscripción a eventos ────────────────────────────────────────
+    # ── event subscription ───────────────────────────────────────────
     def subscribe(self, block: bool = True, timeout: float = 1.0) -> Iterator[ServerEvent]:
-        """Itera sobre eventos del server (job_started, job_progress, etc).
+        """Iterates over server events (job_started, job_progress, etc).
 
-        Útil para que la UI se actualice en tiempo real sin polling.
+        Useful for the UI to update in real time without polling.
         """
         while True:
             try:
@@ -297,8 +293,7 @@ class DaemonClient(AbstractContextManager):
                     return
                 continue
             if isinstance(item, tuple):
-                # Es una respuesta a un request, la devolvemos a la cola
-                # para que el método que espera la pueda leer.
+                # Response to a previous request: re-enqueue for the waiter
                 self._events.put(item)
                 if not block:
                     return
@@ -306,7 +301,7 @@ class DaemonClient(AbstractContextManager):
             yield item
 
     def drain_events(self) -> list[ServerEvent]:
-        """Devuelve todos los eventos pendientes sin bloquear."""
+        """Returns all pending events without blocking."""
         events = []
         while True:
             try:
@@ -314,7 +309,7 @@ class DaemonClient(AbstractContextManager):
             except queue.Empty:
                 break
             if isinstance(item, tuple):
-                # Es respuesta a un request: reencolar
+                # Response to a request: re-enqueue
                 self._events.put(item)
                 break
             events.append(item)

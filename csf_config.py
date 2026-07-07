@@ -1,16 +1,16 @@
-"""Configuración persistente de CopySecureFast.
+"""Persistent configuration for CopySecureFast.
 
-Se guarda en `$XDG_CONFIG_HOME/copysecurefast/settings.json` (default
+Stored in `$XDG_CONFIG_HOME/copysecurefast/settings.json` (default
 `~/.config/copysecurefast/settings.json`).
 
-Formato JSON simple. Schema:
+JSON schema:
 
     {
-        "throttle_bps": 0,            # 0 = sin límite
-        "verify_hash": false,         # calcular SHA-256 al copiar
-        "show_notifications": true,   # notify-send al terminar jobs
-        "autostart_daemon": false,    # arrancar csfd al login
-        "default_dest_dir": "",       # ruta por defecto (vacío = preguntar)
+        "throttle_bps": 0,            # 0 = unlimited
+        "verify_hash": false,         # compute SHA-256 on copy
+        "show_notifications": true,   # notify-send when jobs finish
+        "autostart_daemon": false,    # start csfd at login
+        "default_dest_dir": "",       # default destination (empty = prompt)
         "window_position": "mouse"    # mouse | top-right | remember
     }
 """
@@ -60,7 +60,7 @@ def _config_path() -> Path:
 
 
 def load() -> Settings:
-    """Lee settings del disco. Si no existe, devuelve defaults."""
+    """Reads settings from disk. Returns defaults if the file does not exist."""
     path = _config_path()
     if not path.exists():
         return Settings()
@@ -68,7 +68,7 @@ def load() -> Settings:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return Settings()
-    # Solo tomar keys conocidas
+    # Only accept known keys
     known = {f.name for f in fields(Settings)}
     filtered = {k: v for k, v in data.items() if k in known}
     try:
@@ -78,7 +78,7 @@ def load() -> Settings:
 
 
 def save(settings: Settings) -> None:
-    """Persiste settings. Crea el directorio si no existe."""
+    """Persists settings. Creates the parent directory if needed."""
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")

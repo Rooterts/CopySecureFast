@@ -1,21 +1,20 @@
-//! Servidor JSON-RPC sobre socket Unix.
+//! JSON-RPC server over a Unix socket.
 //!
-//! Protocolo: una línea = un JSON. Cliente envía Request, servidor
-//! responde Response. **Eventos** se envían espontáneamente (job_started,
-//! job_progress, job_done, job_failed) en líneas JSON adicionales.
+//! Protocol: one line = one JSON. Client sends a `Request`, server replies
+//! with a `Response`. **Events** are sent spontaneously
+//! (`job_started`, `job_progress`, `job_completed`, `job_failed`,
+//! `job_paused`, `job_resumed`, `job_cancelled`) as additional JSON lines.
 //!
-//! Conexión: long-lived. El cliente puede desconectarse/reconectarse;
-//! el servidor no requiere que esté siempre conectado (encola igual).
+//! Connection: long-lived. Clients may disconnect/reconnect at any time;
+//! the server does not require a client to be connected to enqueue work.
 //!
-//! Implementa:
-//! - `ping` → `pong`
-//! - `get_queue` → `queue_snapshot`
-//! - `set_throttle` → `queue_snapshot` (con `global_speed_bps`)
-//! - `enqueue` → `enqueued` (con count) y por cada item, eventos
-//!   `job_started` cuando el worker lo toma.
-//! - `pause` → por job_id o todos → `paused`
-//! - `resume` → por job_id o todos → `resumed`
-//! - `cancel` → por job_id o todos → `cancelled`
+//! Implemented methods:
+//! - `ping` -> `pong`
+//! - `get_queue` -> `queue_snapshot`
+//! - `set_throttle` -> `queue_snapshot` (with `global_speed_bps`)
+//! - `enqueue` -> `enqueued` (with count); per item, `job_started` event
+//!   when the worker picks it up.
+//! - `pause`/`resume`/`cancel` -> per `job_id` or all jobs.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,20 +31,20 @@ use crate::ops::copy::{CopyOp, SIGNAL_CANCEL, SIGNAL_PAUSE, SIGNAL_RUN};
 use crate::queue::QueueDb;
 use crate::types::{EnqueueItem, JobItem, JobState, Operation, Request, Response};
 
-/// Canal interno para señales de control de jobs (pause/cancel).
-/// Key = job_id, Value = AtomicU8 compartido con el worker.
+/// Internal channel for job control signals (pause/cancel).
+/// Key = job_id, Value = AtomicU8 shared with the worker.
 pub type JobSignals = Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU8>>>>;
 
 pub struct RpcServer {
     db: Arc<QueueDb>,
     throttle_bps: AtomicU64,
-    /// Canal de eventos para notificar a clientes conectados.
+    /// Event channel used to notify connected clients.
     events: broadcast::Sender<ServerEvent>,
-    /// Mapa de señales activas por job.
+    /// Map of active signals per job.
     signals: JobSignals,
 }
 
-/// Eventos internos que el server emite a los clientes.
+/// Internal events emitted by the server to clients.
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
     JobStarted(JobItem),
@@ -72,13 +71,13 @@ impl RpcServer {
         }
     }
 
-    /// Suscriptor a eventos. Lo usan el worker loop y los clientes
-    /// conectados para enterarse de cambios en la cola.
+    /// Event subscriber. Used by the worker loop and by connected
+    /// clients to receive queue changes.
     pub fn subscribe(&self) -> broadcast::Receiver<ServerEvent> {
         self.events.subscribe()
     }
 
-    /// Devuelve (o crea) la señal atómica de un job.
+    /// Returns (or creates) the atomic signal for a job.
     pub fn signal_for(&self, job_id: &str) -> Arc<std::sync::atomic::AtomicU8> {
         let mut map = self.signals.lock().expect("signals mutex poisoned");
         map.entry(job_id.to_string())
@@ -141,7 +140,7 @@ async fn handle_connection(
             line = lines.next_line() => {
                 let line = match line {
                     Ok(Some(l)) => l,
-                    Ok(None) => return Ok(()), // cliente cerró
+                    Ok(None) => return Ok(()), // client closed
                     Err(e) => {
                         warn!("read error: {}", e);
                         return Err(e.into());
@@ -168,12 +167,12 @@ async fn handle_connection(
                 wr.write_all(b"\n").await?;
                 wr.flush().await?;
             }
-            // Eventos del server → cliente
+            // Events from the server to the client
             ev = events_rx.recv() => {
                 if let Ok(ev) = ev {
                     if let Some(line) = event_to_json(&ev) {
-                        // Ignoramos errores de escritura: si el cliente
-                        // se desconectó, el próximo read va a cerrar.
+                        // Ignore write errors: if the client disconnected,
+                        // the next read will close the connection.
                         if wr.write_all(line.as_bytes()).await.is_err() { return Ok(()); }
                         let _ = wr.write_all(b"\n").await;
                         let _ = wr.flush().await;
@@ -353,15 +352,15 @@ fn enqueue_items(db: &QueueDb, items: &[EnqueueItem]) -> Result<usize, String> {
     Ok(count)
 }
 
-/// Worker loop: cada 200ms revisa la cola, procesa un job pending,
-/// emite eventos.
+/// Worker loop: every 200ms it scans the queue, processes one pending
+/// job and emits events.
 pub async fn worker_loop(db: Arc<QueueDb>, server: Arc<RpcServer>) {
     use std::sync::atomic::AtomicU8;
 
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
     loop {
         tick.tick().await;
-        // Tomar el próximo job pending (si hay).
+        // Pick the next pending job (if any).
         let job = match db.get_all_jobs() {
             Ok(mut jobs) => {
                 jobs.retain(|j| j.state == JobState::Pending);
@@ -381,7 +380,7 @@ pub async fn worker_loop(db: Arc<QueueDb>, server: Arc<RpcServer>) {
         server.emit(ServerEvent::JobStarted(job.clone()));
 
         let signal = server.signal_for(&job.id);
-        // Reset por si quedó colgada de un job anterior.
+        // Reset in case a signal was left from a previous job.
         signal.store(SIGNAL_RUN, Ordering::Relaxed);
 
         // Ejecutar en thread bloqueante (es I/O intensivo de archivos).
@@ -431,13 +430,9 @@ pub async fn worker_loop(db: Arc<QueueDb>, server: Arc<RpcServer>) {
             _ => {}
         }
 
-        // Si quedó en Paused, esperar a que alguien lo reanude antes de
-        // procesarlo de nuevo. Si el usuario lo canceló o reanudó
-        // manualmente, el state en DB ya está actualizado.
-        // Si quedó en Paused por el signal (job cooperativo), persistir
-        // ese estado y NO procesarlo hasta que vuelva a Pending.
-        // Para simplificar: si quedó Paused, lo dejamos así. El worker
-        // no toca jobs Paused porque filtra por Pending.
+        // If the job is left in Paused state, we don't process it again
+        // until it goes back to Pending. The user can resume it manually
+        // or cancel it; the DB state is updated accordingly.
 
         // Cleanup de la signal map.
         {
@@ -446,7 +441,7 @@ pub async fn worker_loop(db: Arc<QueueDb>, server: Arc<RpcServer>) {
         }
 
         // Ahogar el warning de "imported but unused" para AtomicU8 en este
-        // módulo (lo usamos en signal_for arriba).
+        // module (we use it in signal_for above).
         let _ = std::marker::PhantomData::<AtomicU8>;
     }
 }

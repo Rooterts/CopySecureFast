@@ -1,24 +1,24 @@
-"""Excepciones del cliente csf_client.
+"""Exception hierarchy for the csf_client package.
 
-Jerarquía:
+Hierarchy:
     DaemonError (base)
-    ├── DaemonConnectionError   — no se pudo abrir el socket o se cayó
-    ├── DaemonProtocolError     — JSON inválido o no se pudo parsear
-    └── DaemonResponseError     — el daemon devolvió {"event": "error", ...}
+    ├── DaemonConnectionError   - could not open the socket or it dropped
+    ├── DaemonProtocolError     - JSON could not be parsed as JSON-RPC
+    └── DaemonResponseError     - daemon returned {"event": "error", ...}
 """
 
 
 class DaemonError(Exception):
-    """Error base del cliente CopySecureFast."""
+    """Base error for the CopySecureFast client."""
 
 
 class DaemonConnectionError(DaemonError):
-    """No se pudo conectar al daemon (socket no existe, permiso denegado, caído)."""
+    """Could not connect to the daemon (socket missing, permission denied, dropped)."""
 
 
 class DaemonProtocolError(DaemonError):
-    """El mensaje recibido del daemon no se pudo parsear como JSON-RPC válido."""
+    """A message from the daemon could not be parsed as valid JSON-RPC."""
 
 
 class DaemonResponseError(DaemonError):
-    """El daemon respondió con un evento de error explícito."""
+    """The daemon responded with an explicit error event."""

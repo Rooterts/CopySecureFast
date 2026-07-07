@@ -1,39 +1,40 @@
-//! Tipos del protocolo JSON-RPC entre csfd y los adaptadores Python.
+//! JSON-RPC protocol types between csfd (daemon) and Python adapters.
 //!
-//! Dirección: ambos sentidos.
-//! - Cliente → Daemon: enqueue, pause, resume, cancel, get_status, set_throttle
-//! - Daemon → Cliente: job_started, job_progress, job_done, job_failed, job_paused, queue_snapshot
+//! Direction: both ways.
+//! - Client -> Daemon: enqueue, pause, resume, cancel, get_queue, set_throttle, ping
+//! - Daemon -> Client: queue_snapshot, job_started, job_progress, job_completed,
+//!   job_failed, job_paused, job_resumed, job_cancelled, error, pong
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Un ítem individual en la cola. Puede ser un archivo o una carpeta
-/// (desglosada recursivamente en jobs hijos por el daemon).
+/// A single job in the queue. Can be a file or a folder (the latter
+/// is expanded recursively into child jobs by the daemon).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobItem {
-    /// ID único del job (UUID).
+    /// Unique job ID (UUID).
     pub id: String,
-    /// Ruta de origen.
+    /// Source path.
     pub source: PathBuf,
-    /// Ruta de destino.
+    /// Destination path.
     pub dest: PathBuf,
-    /// "copy" o "move".
+    /// "copy" or "move".
     pub op: Operation,
-    /// Estado actual del job.
+    /// Current job state.
     pub state: JobState,
-    /// Bytes totales (0 si se calcula después).
+    /// Total bytes (0 if not yet known).
     pub total_bytes: u64,
-    /// Bytes copiados hasta ahora.
+    /// Bytes copied so far.
     pub copied_bytes: u64,
-    /// Hash SHA-256 del archivo (calculado post-copia o pre-copia si se requiere).
+    /// SHA-256 hash (computed post-copy or pre-copy if requested).
     pub hash: Option<String>,
-    /// Timestamp de cuando entró en la cola (epoch seconds).
+    /// Timestamp of when the job entered the queue (epoch seconds).
     pub enqueued_at: i64,
-    /// Timestamp de cuando terminó (0 si no terminó).
+    /// Timestamp of when the job finished (0 if still running).
     pub finished_at: i64,
-    /// Mensaje de error si state == failed.
+    /// Error message if state == Failed.
     pub error: Option<String>,
-    /// Si true, calcula hash SHA-256 post-copia para verificar integridad.
+    /// If true, SHA-256 hash is computed post-copy to verify integrity.
     #[serde(default)]
     pub verify_hash: bool,
 }
@@ -44,7 +45,8 @@ pub enum Operation {
     Copy,
     Move,
 }
-/// Estado actual del job.
+
+/// Current state of a job.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
@@ -57,17 +59,17 @@ pub enum JobState {
 }
 
 impl JobState {
-    /// Estados en los que un job puede ser cancelado.
+    /// States in which a job can be cancelled.
     pub fn is_cancellable(&self) -> bool {
         matches!(self, JobState::Pending | JobState::Running | JobState::Paused)
     }
 
-    /// Estados en los que un job puede ser pausado.
+    /// States in which a job can be paused.
     pub fn is_pausable(&self) -> bool {
         matches!(self, JobState::Pending | JobState::Running)
     }
 
-    /// Estados en los que un job puede ser reanudado.
+    /// States in which a job can be resumed.
     pub fn is_resumable(&self) -> bool {
         matches!(self, JobState::Paused)
     }
@@ -79,29 +81,29 @@ impl Default for JobState {
     }
 }
 
-/// Request del cliente → daemon.
+/// Client -> Daemon request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Request {
-    /// Agregar archivos/carpetas a la cola.
+    /// Add files/folders to the queue.
     #[serde(rename = "enqueue")]
     Enqueue { items: Vec<EnqueueItem> },
-    /// Pausar un job específico o "global" para pausar todos.
+    /// Pause a specific job (job_id) or all jobs (None).
     #[serde(rename = "pause")]
     Pause { job_id: Option<String> },
-    /// Reanudar un job pausado o todos.
+    /// Resume a paused job or all paused jobs.
     #[serde(rename = "resume")]
     Resume { job_id: Option<String> },
-    /// Cancelar un job o todos.
+    /// Cancel a job or all jobs.
     #[serde(rename = "cancel")]
     Cancel { job_id: Option<String> },
-    /// Obtener estado actual de la cola.
+    /// Get the current queue state.
     #[serde(rename = "get_queue")]
     GetQueue,
-    /// Limitar velocidad global (bytes/s, 0 = sin límite).
+    /// Set the global speed limit (bytes/s, 0 = unlimited).
     #[serde(rename = "set_throttle")]
     SetThrottle { bytes_per_second: u64 },
-    /// Ping para mantener conexión viva.
+    /// Ping to keep the connection alive / health check.
     #[serde(rename = "ping")]
     Ping,
 }
@@ -111,31 +113,31 @@ pub struct EnqueueItem {
     pub source: PathBuf,
     pub dest: PathBuf,
     pub op: Operation,
-    /// Si true, calcula hash SHA-256 post-copia para verificar integridad.
+    /// If true, SHA-256 hash is computed post-copy to verify integrity.
     #[serde(default)]
     pub verify_hash: bool,
 }
 
-/// Response del daemon → cliente.
+/// Daemon -> Client response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data")]
 pub enum Response {
-    /// La cola actual completa (respuesta a get_queue).
+    /// Full queue state (reply to get_queue).
     #[serde(rename = "queue_snapshot")]
     QueueSnapshot {
         jobs: Vec<JobItem>,
         global_speed_bps: u64,
     },
-    /// Un job cambió de estado.
+    /// A job state changed.
     #[serde(rename = "job_update")]
     JobUpdate { job: JobItem },
-    /// Confirmación de acción (ack del enqueue).
+    /// Acknowledgement of an enqueue request.
     #[serde(rename = "enqueued")]
     Enqueued { count: usize },
-    /// Error en el request.
+    /// Error in a request.
     #[serde(rename = "error")]
     Error { message: String },
-    /// Respuesta a ping.
+    /// Reply to a ping.
     #[serde(rename = "pong")]
     Pong,
 }

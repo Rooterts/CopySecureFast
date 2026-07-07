@@ -1,16 +1,13 @@
-"""Ventana flotante de cola — estilo TeraCopy/SuperCopier.
+"""Floating queue window - TeraCopy/SuperCopier style.
 
-Características:
-- Tamaño compacto, NO se maximiza, queda arriba a la derecha.
-- Header con título + botones minimizar/cerrar + throttle.
-- Barra global de progreso + velocidad agregada + ETA.
-- Lista scrolleable de jobs en curso con barra individual.
-- Botones de pausar/reanudar/cancelar por fila.
-- Suscripción a eventos del daemon (no polling): actualización en vivo.
-
-Modos:
-- Modo normal: lista vertical con todas las filas.
-- Modo minimal: solo la barra global, para cuando no hay nada interesante.
+Features:
+- Compact size, does not maximize, stays in a corner.
+- Header with title + minimize/close + throttle.
+- Global status bar + aggregate speed + ETA.
+- Scrollable list of jobs with per-row progress.
+- Per-row pause/resume/cancel buttons.
+- Global buttons: Pause all / Resume all / Cancel all.
+- Live updates via daemon event subscription (no polling).
 """
 
 from __future__ import annotations
@@ -169,7 +166,7 @@ class QueueWindow(Adw.ApplicationWindow):
         super().__init__(application=app)
         self.set_title("CopySecureFast")
         self.set_default_size(WIN_W, WIN_H)
-        # No maximizar nunca, comportamiento de herramienta.
+        # Never maximize: behaves like a tool window.
         self.set_resizable(True)
 
         self._client = DaemonClient(socket_path=socket_path)
@@ -443,10 +440,12 @@ class QueueWindow(Adw.ApplicationWindow):
         self._reconcile(jobs)
 
     def _start_event_loop(self) -> None:
-        """Usa GLib.timeout_add para drenar la cola de eventos cada 100ms."""
-        # El reader thread del DaemonClient empuja eventos a queue.Queue.
-        # GLib.timeout_add nos da un lugar seguro para actualizar widgets
-        # desde el main loop de GTK.
+        """Starts a timer that drains the event queue every 100ms.
+
+        The DaemonClient reader thread pushes events into a queue.Queue.
+        GLib.timeout_add gives us a safe place to update widgets from
+        the GTK main loop.
+        """
         GLib.timeout_add(100, self._drain_events)
 
     def _drain_events(self) -> bool:

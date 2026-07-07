@@ -1,19 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  CopySecureFast — Custom Actions para Thunar (flujo TeraCopy/SuperCopier).
-  Para instalar: cp thunar-extension/copysecurefast-uca.xml ~/.config/Thunar/uca.xml
-  (o mergeá los <action> dentro de tu uca.xml existente).
+  CopySecureFast - Custom Actions for Thunar (TeraCopy/SuperCopier flow).
+  To install: cp thunar-extension/copysecurefast-uca.xml ~/.config/Thunar/uca.xml
+  (or merge the <action> elements into your existing uca.xml).
 
-  Después reiniciá Thunar (cerrá todas las ventanas) y volvé a abrir.
+  Then restart Thunar (close all windows) and reopen.
 
-  Flujo de uso:
-  1. Seleccioná archivos/carpetas, click derecho → "Copiar con CopySecureFast"
-     → click derecho sobre la carpeta destino → "Pegar con CopySecureFast"
-  2. La ventana flotante aparece automáticamente con la cola en vivo.
+  Usage flow:
+  1. Select files/folders, right-click -> "Copiar con CopySecureFast"
+     -> right-click on destination folder -> "Pegar con CopySecureFast"
+  2. The floating window appears automatically with the live queue.
 -->
 <actions>
 
-  <!-- Acción previa: abrir terminal (preservada) -->
+  <!-- Previous user action: open terminal (preserved) -->
   <action>
     <icon>utilities-terminal</icon>
     <name>Open Terminal Here</name>
@@ -25,16 +25,16 @@
   </action>
 
   <!--
-    Copiar con CSF — marca los archivos en el clipboard CSF. NO copia
-    todavía. La copia real ocurre cuando el usuario hace click derecho
-    en la carpeta destino → "Pegar con CopySecureFast". Esto es el
-    flujo TeraCopy/SuperCopier.
+    Copiar con CSF - marks files in the CSF clipboard. Does NOT copy
+    yet. The actual copy happens when the user right-clicks on the
+    destination folder -> "Pegar con CopySecureFast". This is the
+    TeraCopy/SuperCopier flow.
   -->
   <action>
     <icon>edit-copy</icon>
     <name>Copiar con CopySecureFast</name>
     <unique-id>csf-copy</unique-id>
-    <description>Marcar archivos para copiar (luego 'Pegar con CSF' en destino)</description>
+    <description>Mark files for copying (then 'Pegar con CSF' on destination)</description>
     <command>sh -c 'csf-thunar-helper copy "$@" &amp;&amp; notify-send "CopySecureFast" "Marcados para copiar. Click derecho en destino → Pegar con CopySecureFast" || true' sh</command>
     <patterns>*</patterns>
     <directories/>
@@ -49,7 +49,7 @@
     <icon>edit-cut</icon>
     <name>Cortar con CopySecureFast</name>
     <unique-id>csf-cut</unique-id>
-    <description>Marcar archivos para mover (luego 'Pegar con CSF' en destino)</description>
+    <description>Mark files for moving (then 'Pegar con CSF' on destination)</description>
     <command>sh -c 'csf-thunar-helper cut "$@" &amp;&amp; notify-send "CopySecureFast" "Marcados para mover. Click derecho en destino → Pegar con CopySecureFast" || true' sh</command>
     <patterns>*</patterns>
     <directories/>
@@ -60,28 +60,27 @@
     <video-files/>
   </action>
 
-  <!-- Pegar con CSF: encola los items del clipboard en esta carpeta.
-       Usa %d (current directory de Thunar) para que funcione tanto al
-       click derecho en el fondo como sobre un item de la carpeta. -->
+  <!-- Pegar con CSF: enqueues the clipboard items in this folder.
+       Uses %d (current directory in Thunar) so it works both for
+       right-click on the background and on a folder item. -->
   <action>
     <icon>edit-paste</icon>
     <name>Pegar con CopySecureFast</name>
     <unique-id>csf-paste</unique-id>
-    <description>Encolar copia/move de los items marcados en esta carpeta</description>
+    <description>Enqueue copy/move of the marked items in this folder</description>
     <command>sh -c 'csf-thunar-helper paste "$1" || notify-send "CopySecureFast" "Clipboard CSF vacío"' sh %d</command>
     <patterns>*</patterns>
     <directories/>
   </action>
 
   <!--
-    Copiar directo a una carpeta: click derecho sobre archivos, "Copiar a..."
-    → abre un diálogo nativo de selección de carpeta.
+    Copy to...: right-click on files -> opens a native folder picker.
   -->
   <action>
     <icon>folder-copy</icon>
     <name>Copiar a...</name>
     <unique-id>csf-copy-to</unique-id>
-    <description>Copiar seleccionados a una carpeta elegida</description>
+    <description>Copy selected items to a chosen folder</description>
     <command>sh -c 'DEST=$(zenity --file-selection --directory --title="Copiar con CopySecureFast a..." 2&gt;/dev/null) &amp;&amp; [ -n "$DEST" ] &amp;&amp; csf-thunar-helper copy "$@" &amp;&amp; csf-thunar-helper paste "$DEST" || true' sh %F</command>
     <patterns>*</patterns>
     <directories/>
@@ -96,7 +95,7 @@
     <icon>folder-move</icon>
     <name>Mover a...</name>
     <unique-id>csf-move-to</unique-id>
-    <description>Mover seleccionados a una carpeta elegida</description>
+    <description>Move selected items to a chosen folder</description>
     <command>sh -c 'DEST=$(zenity --file-selection --directory --title="Mover con CopySecureFast a..." 2&gt;/dev/null) &amp;&amp; [ -n "$DEST" ] &amp;&amp; csf-thunar-helper cut "$@" &amp;&amp; csf-thunar-helper paste "$DEST" || true' sh %F</command>
     <patterns>*</patterns>
     <directories/>
@@ -107,12 +106,12 @@
     <video-files/>
   </action>
 
-  <!-- Drop: al soltar archivos sobre una carpeta, copiar/mover -->
+  <!-- Drop: drop files onto a folder, copy/move -->
   <action>
     <icon>edit-copy</icon>
     <name>Copiar aquí con CopySecureFast</name>
     <unique-id>csf-drop-copy</unique-id>
-    <description>Drop: copiar seleccionados a esta carpeta</description>
+    <description>Drop: copy selected items into this folder</description>
     <command>sh -c 'csf-thunar-helper copy "$@" &amp;&amp; csf-thunar-helper paste "$1" || true' sh %F %f</command>
     <patterns>*</patterns>
     <directories/>
@@ -127,7 +126,7 @@
     <icon>edit-cut</icon>
     <name>Mover aquí con CopySecureFast</name>
     <unique-id>csf-drop-move</unique-id>
-    <description>Drop: mover seleccionados a esta carpeta</description>
+    <description>Drop: move selected items into this folder</description>
     <command>sh -c 'csf-thunar-helper cut "$@" &amp;&amp; csf-thunar-helper paste "$1" || true' sh %F %f</command>
     <patterns>*</patterns>
     <directories/>
@@ -138,12 +137,12 @@
     <video-files/>
   </action>
 
-  <!-- Utilidades -->
+  <!-- Utilities -->
   <action>
     <icon>view-list-symbolic</icon>
     <name>Ver cola de CopySecureFast</name>
     <unique-id>csf-queue</unique-id>
-    <description>Abrir la ventana flotante con la cola</description>
+    <description>Open the floating queue window</description>
     <command>csf-thunar-helper queue</command>
     <patterns>*</patterns>
     <directories/>
@@ -158,7 +157,7 @@
     <icon>preferences-system-network</icon>
     <name>CSF: estado del daemon</name>
     <unique-id>csf-status</unique-id>
-    <description>Mostrar el estado de la cola y del daemon</description>
+    <description>Show the queue and daemon state as a notification</description>
     <command>sh -c 'csf-thunar-helper status | xargs -I{} notify-send "CopySecureFast" "{}" || true'</command>
     <patterns>*</patterns>
     <directories/>

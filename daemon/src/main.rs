@@ -1,20 +1,19 @@
-//! CopySecureFast daemon — entry point.
+//! CopySecureFast daemon - entry point.
 //!
-//! Inicializa logging, abre la DB SQLite, levanta el servidor JSON-RPC
-//! sobre socket Unix, mantiene un worker loop que procesa jobs pending
-//! y opcionalmente auto-arranca `csfd-tray` para tener un tray icon.
+//! Initializes logging, opens the SQLite database, starts the JSON-RPC
+//! server over a Unix socket, runs a worker loop that processes pending
+//! jobs, and optionally auto-spawns `csfd-tray` for a system tray icon.
 //!
-//! Rutas por defecto (resolubles vía env vars o paths estándar):
+//! Default paths (overridable via env vars or CLI flags):
 //! - Socket: `XDG_RUNTIME_DIR/copysecurefast.sock` (fallback `/tmp/copysecurefast.sock`)
 //! - DB:     `XDG_DATA_HOME/copysecurefast/queue.db` (fallback `~/.local/share/...`)
-//! - Logs:   `XDG_DATA_HOME/copysecurefast/logs/csfd.log` (rotación diaria)
+//! - Logs:   `XDG_DATA_HOME/copysecurefast/logs/csfd.log` (daily rotation)
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Parser;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -34,19 +33,19 @@ const DEFAULT_LOG_FILE: &str = "csfd.log";
 #[derive(Parser, Debug)]
 #[command(name = "csfd", version, about = "CopySecureFast daemon")]
 struct Args {
-    /// Iniciar también el tray icon (default: sí)
+    /// Spawn the tray icon as well (default: yes)
     #[arg(long, default_value_t = true)]
     with_tray: bool,
 
-    /// No iniciar el tray icon
+    /// Do not spawn the tray icon
     #[arg(long, conflicts_with = "with_tray")]
     no_tray: bool,
 
-    /// Path del socket (override env / default)
+    /// Socket path (overrides env / default)
     #[arg(long)]
     socket: Option<String>,
 
-    /// Path de la DB (override env / default)
+    /// Database path (overrides env / default)
     #[arg(long)]
     db: Option<String>,
 }
@@ -97,10 +96,10 @@ fn socket_path() -> PathBuf {
     runtime_dir().join(DEFAULT_SOCKET_NAME)
 }
 
-/// Busca el binario csfd-tray. Orden:
-/// 1) `$HOME/.local/bin/csfd-tray` (wrapper que el repo provee)
-/// 2) `$PATH` (cualquier csfd-tray ejecutable)
-/// 3) Junto al binario actual de csfd (instalación via cargo)
+/// Locates the `csfd-tray` binary. Search order:
+/// 1) `$HOME/.local/bin/csfd-tray` (wrapper shipped by this repo)
+/// 2) `$PATH` (any `csfd-tray` executable)
+/// 3) Next to the current csfd binary (cargo install location)
 fn find_tray_binary() -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(home) = dirs::home_dir() {
@@ -124,7 +123,9 @@ fn spawn_tray(socket: &str) -> std::io::Result<u32> {
     if !tray_bin.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("csfd-tray no encontrado (buscado: ~/.local/bin/csfd-tray, $PATH, junto al binario)"),
+            format!(
+                "csfd-tray not found (looked in: ~/.local/bin/csfd-tray, $PATH, next to csfd)"
+            ),
         ));
     }
     Command::new(&tray_bin)
@@ -164,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = Arc::new(QueueDb::new(&db_p)?);
     let rpc = Arc::new(RpcServer::new(db.clone()));
 
-    // Worker loop: procesa jobs pending
+    // Worker loop: processes pending jobs.
     {
         let db_w = db.clone();
         let server_w = rpc.clone();
@@ -173,13 +174,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // Tray icon (default: sí). Si no se puede iniciar, log warning y
-    // continúa (modo headless; --no-tray para silenciar el warning).
+    // Tray icon (default: yes). If it cannot be started, log a warning
+    // and continue in headless mode (use --no-tray to silence the warning).
     if want_tray {
         match spawn_tray(&sock) {
-            Ok(pid) => info!(pid, "csfd-tray spawned (system tray activo)"),
+            Ok(pid) => info!(pid, "csfd-tray spawned (system tray active)"),
             Err(e) => warn!(
-                "no se pudo iniciar csfd-tray: {} (continuando sin tray; usá --no-tray para silenciar)",
+                "could not start csfd-tray: {} (continuing without tray; use --no-tray to silence this warning)",
                 e
             ),
         }

@@ -1,10 +1,12 @@
-//! Capa de persistencia SQLite de la cola de jobs.
+//! SQLite persistence layer for the job queue.
 //!
-//! Maneja el schema y CRUD básico de jobs. Usa rusqlite con SQLite bundled
-//! (no requiere libsqlite3-sys del sistema). La conexión NO es thread-safe
-//! por sí sola, por eso en main.rs se accede detrás de un Mutex si se
-//! necesita concurrencia. Para el spike usamos operaciones sincrónicas
-//! protegidas por el Arc<Mutex<>> que se puede agregar más adelante.
+//! Handles the schema and basic CRUD for jobs. Uses rusqlite with a
+//! bundled SQLite (no system libsqlite3-sys required). The connection
+//! is NOT thread-safe on its own, which is why in main.rs access is
+//! guarded by a Mutex when concurrency is needed. For this spike we
+//! use synchronous operations protected by `Arc<Mutex<>>`, which can
+//! be replaced with a connection pool (`r2d2_sqlite` or similar) for
+//! production use.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -12,17 +14,18 @@ use std::sync::Mutex;
 
 use crate::types::{JobItem, JobState, Operation};
 
-/// Wrapper sobre la conexión SQLite de la cola.
+/// Wrapper around the SQLite connection for the job queue.
 ///
-/// Usa `Mutex<Connection>` porque rusqlite::Connection no es `Send`
-/// (tiene RefCell internamente). En el spike esto es suficiente; en
-/// producción se migraría a un connection pool (`r2d2_sqlite` o similar).
+/// Uses `Mutex<Connection>` because `rusqlite::Connection` is not `Send`
+/// (it contains a RefCell internally). For this spike this is sufficient;
+/// in production this would be migrated to a connection pool
+/// (`r2d2_sqlite` or similar).
 pub struct QueueDb {
     conn: Mutex<Connection>,
 }
 
 impl QueueDb {
-    /// Abre (o crea) la DB en `path` e inicializa el schema.
+    /// Opens (or creates) the database at `path` and initializes the schema.
     pub fn new(path: &Path) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -57,7 +60,7 @@ impl QueueDb {
             )",
             [],
         )?;
-        // Índice por estado para consultas rápidas del worker loop.
+        // Index by state for fast worker-loop queries.
         self.lock().execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)",
             [],
@@ -65,8 +68,8 @@ impl QueueDb {
         Ok(())
     }
 
-    /// Inserta un job nuevo. `verify_hash` se persiste aparte porque en
-    /// `EnqueueItem` puede cambiar respecto al `JobItem` encolado.
+    /// Inserts a new job. `verify_hash` is persisted separately because
+    /// in `EnqueueItem` it can change relative to the enqueued `JobItem`.
     pub fn insert_job(&self, job: &JobItem) -> Result<(), rusqlite::Error> {
         self.lock().execute(
             "INSERT INTO jobs (id, source, dest, op, state, total_bytes,
@@ -90,10 +93,9 @@ impl QueueDb {
         Ok(())
     }
 
-    /// Actualiza el estado y métricas de un job existente.
+    /// Updates the state of a job by id.
+    /// Returns true if a row was updated (i.e. the job existed).
     pub fn update_state(&self, id: &str, new_state: JobState) -> Result<bool, rusqlite::Error> {
-        // Devuelve true si actualizó una fila (es decir, el job existía y
-        // el cambio de estado estaba permitido).
         let rows = self.lock().execute(
             "UPDATE jobs SET state = ?1 WHERE id = ?2",
             params![state_to_str(new_state), id],
@@ -101,6 +103,7 @@ impl QueueDb {
         Ok(rows > 0)
     }
 
+    /// Updates the state and metrics of an existing job.
     pub fn update_job(&self, job: &JobItem) -> Result<(), rusqlite::Error> {
         self.lock().execute(
             "UPDATE jobs SET state=?1, total_bytes=?2, copied_bytes=?3,
@@ -118,7 +121,7 @@ impl QueueDb {
         Ok(())
     }
 
-    /// Devuelve todos los jobs (sin orden particular).
+    /// Returns all jobs (no particular order).
     pub fn get_all_jobs(&self) -> Result<Vec<JobItem>, rusqlite::Error> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -134,7 +137,7 @@ impl QueueDb {
         Ok(out)
     }
 
-    /// Devuelve un job por id.
+    /// Returns a job by id.
     pub fn get_job(&self, id: &str) -> Result<Option<JobItem>, rusqlite::Error> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -145,7 +148,7 @@ impl QueueDb {
         stmt.query_row(params![id], row_to_job).optional()
     }
 
-    /// Borra jobs en estado Completed/Failed/Cancelled (limpieza).
+    /// Deletes jobs in Completed/Failed/Cancelled state (cleanup).
     pub fn purge_finished(&self) -> Result<usize, rusqlite::Error> {
         let n = self.lock().execute(
             "DELETE FROM jobs WHERE state IN ('completed','failed','cancelled')",
@@ -264,7 +267,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("csfd-test-{}", uuid::Uuid::new_v4()));
         let db = QueueDb::new(&dir.join("q.db")).unwrap();
 
-        let mut job = JobItem {
+        let job = JobItem {
             id: "x".into(),
             source: "/tmp/a".into(),
             dest: "/tmp/b".into(),
@@ -280,9 +283,8 @@ mod tests {
         };
         db.insert_job(&job).unwrap();
 
-        job.state = JobState::Completed;
-        job.finished_at = now();
-        db.update_job(&job).unwrap();
+        let updated = db.update_state("x", JobState::Completed).unwrap();
+        assert!(updated);
 
         let got = db.get_job("x").unwrap().unwrap();
         assert_eq!(got.state, JobState::Completed);

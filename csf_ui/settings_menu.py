@@ -1,19 +1,18 @@
-"""Submenú de Configuración para el tray icon.
+"""Settings submenu for the tray icon.
 
-Lee/escribe settings en `~/.config/copysecurefast/settings.json` (via
-`csf_config`). Los settings se aplican:
+Reads/writes settings in `~/.config/copysecurefast/settings.json` (via
+`csf_config`). Settings are applied as follows:
 
-- `throttle_bps`: al iniciar el daemon y cuando se cambia desde acá
-  (vía el daemon RPC `set_throttle`).
-- `verify_hash`: se aplica en cada `enqueue` que se hace desde la UI.
-- `show_notifications`: cuando los jobs terminan.
-- `autostart_daemon`: crea/borra el .desktop en
+- `throttle_bps`: applied immediately via the daemon RPC `set_throttle`.
+- `verify_hash`: applied on each enqueue made from the UI.
+- `show_notifications`: shown when jobs finish.
+- `autostart_daemon`: creates/removes the .desktop in
   `~/.config/autostart/copysecurefast.desktop`.
-- `default_dest_dir`: si está configurado, el "Pegar con" lo usa
-  sin pedir destino. (Próxima mejora.)
+- `default_dest_dir`: if set, "Paste with" uses it without asking.
+  (Future improvement.)
 
-El submenú se construye dinámicamente cuando el usuario hace click
-derecho en el tray icon, leyendo los settings actuales del disco.
+The submenu is built dynamically every time the user right-clicks the
+tray icon, reading the current settings from disk.
 """
 
 from __future__ import annotations
@@ -51,26 +50,26 @@ AUTOSTART_FILE = AUTOSTART_DIR / "copysecurefast.desktop"
 
 
 def _set_throttle(bps: int, parent_menu: Gtk.MenuItem | None = None) -> None:
-    """Aplica el throttle via el daemon RPC."""
+    """Applies the throttle via the daemon RPC."""
     sock = os.environ.get("CSF_SOCKET", "/tmp/copysecurefast.sock")
     try:
         from csf_client import DaemonClient
         with DaemonClient(socket_path=sock) as c:
             applied = c.set_throttle(bps)
-            print(f"[csf-tray] throttle = {applied} B/s")
+            print(f"[csfd-tray] throttle = {applied} B/s")
     except Exception as e:
-        print(f"[csf-tray] no pude aplicar throttle: {e}", file=sys.stderr)
+        print(f"[csfd-tray] could not apply throttle: {e}", file=sys.stderr)
 
 
 def _toggle_autostart(enable: bool) -> None:
-    """Crea o borra el .desktop de autostart."""
+    """Creates or removes the autostart .desktop file."""
     if enable:
         AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
         AUTOSTART_FILE.write_text(
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=CopySecureFast daemon\n"
-            "Comment=Daemon de CopySecureFast con tray icon\n"
+            "Comment=CopySecureFast daemon with tray icon\n"
             "Exec=csfd\n"
             "Icon=folder-copy\n"
             "Terminal=false\n"
@@ -83,12 +82,11 @@ def _toggle_autostart(enable: bool) -> None:
 
 
 def _open_config_in_editor() -> None:
-    """Abre el archivo de config con xdg-open o el editor del entorno."""
+    """Opens the config file with xdg-open (uses the default editor)."""
     path = csf_config._config_path()
     if not path.exists():
-        # Crear con defaults primero
+        # Create with defaults first
         csf_config.save(csf_config.Settings())
-    # xdg-open (que en niri abre con el editor default o kitty+nvim según config)
     subprocess.Popen(
         ["xdg-open", str(path)],
         stdout=subprocess.DEVNULL,
@@ -143,10 +141,9 @@ def _add_radio_items(
 
 
 def build(parent_menu: Gtk.Menu) -> Gtk.MenuItem:
-    """Construye el submenú 'Configuración' y lo agrega al menú del tray.
+    """Builds the 'Settings' submenu and attaches it to the tray menu.
 
-    Devuelve el Gtk.MenuItem agregado para que el caller lo ubique
-    en la posición correcta.
+    Returns the Gtk.MenuItem added so the caller can position it.
     """
     settings = _reload_settings()
 
@@ -155,8 +152,8 @@ def build(parent_menu: Gtk.Menu) -> Gtk.MenuItem:
     config_submenu = Gtk.Menu()
     config_item.set_submenu(config_submenu)
 
-    # ── Throttle (sub-submenu con presets)
-    throttle_item = Gtk.MenuItem(label="Velocidad máxima")
+    # ── Throttle (sub-submenu with presets)
+    throttle_item = Gtk.MenuItem(label="Max speed")
     throttle_item.show()
     throttle_menu = Gtk.Menu()
     throttle_item.set_submenu(throttle_menu)
@@ -179,7 +176,7 @@ def build(parent_menu: Gtk.Menu) -> Gtk.MenuItem:
 
     config_submenu.append(_separator())
 
-    # ── Toggles booleanos
+    # ── Boolean toggles
     def make_toggle(attr, on_apply):
         def cb(active):
             s = _reload_settings()
@@ -190,33 +187,33 @@ def build(parent_menu: Gtk.Menu) -> Gtk.MenuItem:
 
     _add_check_item(
         config_submenu,
-        "Verificar hash SHA-256 al copiar",
+        "Verify SHA-256 hash on copy",
         settings.verify_hash,
         make_toggle("verify_hash", lambda s: None),
     )
     _add_check_item(
         config_submenu,
-        "Notificaciones al terminar",
+        "Show notifications on finish",
         settings.show_notifications,
         make_toggle("show_notifications", lambda s: None),
     )
     _add_check_item(
         config_submenu,
-        "Iniciar daemon al login (autostart)",
+        "Start daemon at login (autostart)",
         settings.autostart_daemon,
         make_toggle("autostart_daemon", _toggle_autostart),
     )
 
     config_submenu.append(_separator())
 
-    # ── Acciones
-    open_item = Gtk.MenuItem(label="Editar configuración (JSON)…")
+    # ── Actions
+    open_item = Gtk.MenuItem(label="Edit configuration (JSON)...")
     open_item.connect("activate", lambda *_: _open_config_in_editor())
     open_item.show()
     config_submenu.append(open_item)
 
-    reload_item = Gtk.MenuItem(label="Recargar configuración")
-    reload_item.connect("activate", lambda *_: print("[csf-tray] settings recargados"))
+    reload_item = Gtk.MenuItem(label="Reload configuration")
+    reload_item.connect("activate", lambda *_: print("[csfd-tray] settings reloaded"))
     reload_item.show()
     config_submenu.append(reload_item)
 

@@ -1,12 +1,12 @@
-"""csfd-tray: app GTK3 con AyatanaAppIndicator3 (system tray).
+"""csfd-tray: GTK3 app with AyatanaAppIndicator3 (system tray).
 
-Click derecho en el tray icon: menú con Configuración, Mostrar cola,
-Pausar/Reanudar/Cancelar todo, Salir.
+Right-click on the tray icon: menu with Settings, Show queue,
+Pause/Resume/Cancel all, Quit.
 
-NOTA IMPORTANTE: AyatanaAppIndicator3 SOLO funciona con Gtk 3.0.
-Por eso este binario usa Gtk 3 y NO importa csf_ui/__init__.py (que
-carga queue_window.py que requiere Gtk 4). Importamos los submódulos
-directamente por path para evitar la carga transitiva.
+IMPORTANT: AyatanaAppIndicator3 only works with Gtk 3.0.
+That's why this binary uses Gtk 3 and does NOT import csf_ui/__init__.py
+(which would transitively load queue_window.py that requires Gtk 4).
+We import submodules directly by path to avoid the transitive load.
 """
 
 from __future__ import annotations

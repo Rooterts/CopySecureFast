@@ -1,27 +1,27 @@
-"""CopySecureFast — Helper CLI para integración con file managers.
+"""CopySecureFast CLI helper for integration with file managers.
 
-Tres modos de invocación desde Thunar (vía .uca):
+Three invocation modes from Thunar (via .uca):
 
-1. Click derecho sobre archivos/carpetas seleccionados:
+1. Right-click on files/folders:
    `csf-thunar-helper copy <sources>... <dest_dir>`
-   → encola copias. El helper infiere el destino de Thunar.
+   -> enqueues copies. The helper infers the destination from Thunar.
 
-2. Click derecho sobre una carpeta con archivos "copiados previamente":
+2. Right-click on a folder with previously "copied" items:
    `csf-thunar-helper paste <dest_dir>`
-   → encola lo que esté en `~/.cache/csf/clipboard.json` (gestionado
-     por copy/cut).
+   -> enqueues whatever is in `~/.cache/csf/clipboard.json` (managed
+     by copy/cut).
 
-3. Mover (cortar):
+3. Move (cut):
    `csf-thunar-helper cut <sources>... <dest_dir>`
 
-Comandos auxiliares:
-- `csf-thunar-helper queue`    abre la ventana flotante
-- `csf-thunar-helper status`   texto de la cola
+Auxiliary commands:
+- `csf-thunar-helper queue`    opens the floating window
+- `csf-thunar-helper status`   text dump of the queue
 - `csf-thunar-helper ping`     health check
-- `csf-thunar-helper throttle <bps>`  limitador
+- `csf-thunar-helper throttle <bps>`  speed limit
 
-El helper es BLOQUEANTE pero rápido: encola y termina. La UI/tray
-se actualiza en vivo vía eventos.
+The helper is BLOCKING but fast: enqueue and exit. The UI/tray updates
+in real time via daemon events.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ if str(_REPO) not in sys.path:
 from csf_client import DaemonClient, DaemonConnectionError, EnqueueItem, Operation  # noqa: E402
 
 
-# Archivo donde el helper persiste la "cola del portapapeles CSF"
-# (qué archivos fueron copiados/cortados para pegar después).
+# File where the helper persists the "CSF clipboard queue"
+# (which files were copied/cut for later paste).
 CLIPBOARD_FILE = Path.home() / ".cache" / "csf" / "clipboard.json"
 
 
@@ -65,7 +65,7 @@ def _find_socket() -> str | None:
 
 
 def _load_clipboard() -> dict:
-    """Lee el clipboard CSF. Formato:
+    """Reads the CSF clipboard. Format:
     {"op": "copy"|"cut", "items": ["/path/1", "/path/2", ...]}
     """
     if not CLIPBOARD_FILE.exists():
@@ -82,11 +82,12 @@ def _save_clipboard(op: str, items: list[str]) -> None:
 
 
 def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list[str]) -> int:
-    """Encola cada source como un job apuntando a dest.
+    """Enqueues each source as a job pointing to dest.
 
-    Si el source es un directorio, expande recursivamente y crea un job
-    por archivo (cada uno con destino = <dest>/<basename_directorio>/<ruta_rel>).
-    Si el source es un archivo y dest es directorio, va a <dest>/<basename>.
+    If the source is a directory, expands it recursively and creates
+    one job per file (each one with destination =
+    <dest>/<basename_source_dir>/<relative_path>). If the source is a
+    file and dest is a directory, it goes to <dest>/<basename>.
     """
     dest_path = Path(dest)
     items: list[EnqueueItem] = []
@@ -95,7 +96,7 @@ def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list
         for s in sources:
             src = Path(s)
             if not src.exists():
-                print(f"aviso: {src} no existe; se omite", file=sys.stderr)
+                print(f"warning: {src} does not exist; skipping", file=sys.stderr)
                 continue
             if src.is_file():
                 target = dest_path / src.name
@@ -108,8 +109,8 @@ def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list
                             break
                 items.append(EnqueueItem(str(src), str(target), op))
             elif src.is_dir():
-                # Expandir recursivamente: cada archivo va a
-                # <dest>/<basename_src>/<ruta_relativa>
+                # Expand recursively: each file goes to
+                # <dest>/<basename_src>/<relative_path>
                 subdir = dest_path / src.name
                 for child in _walk_files(src):
                     rel = child.relative_to(src)
@@ -118,16 +119,16 @@ def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list
     else:
         if len(sources) > 1:
             print(
-                f"aviso: destino {dest} no es directorio; solo el primero de {len(sources)}",
+                f"warning: destination {dest} is not a directory; only the first of {len(sources)} sources will be enqueued",
                 file=sys.stderr,
             )
         if sources:
             src = Path(sources[0])
             if not src.exists():
-                print(f"aviso: {src} no existe", file=sys.stderr)
+                print(f"warning: {src} does not exist", file=sys.stderr)
                 return 0
             if src.is_dir():
-                # Modo rename: copia la carpeta entera al destino
+                # Rename mode: copy the whole folder to the destination
                 items.append(EnqueueItem(str(src), dest, op))
             else:
                 items.append(EnqueueItem(str(src), dest, op))
@@ -135,23 +136,20 @@ def _enqueue_paths(client: DaemonClient, op: Operation, dest: str, sources: list
     if not items:
         return 0
     n = client.enqueue(items)
-    print(f"csfd: encolados {n} jobs ({op.value})")
+    print(f"csfd: enqueued {n} jobs ({op.value})")
     return n
 
 
 def _walk_files(root: Path):
-    """Itera recursivamente sobre todos los archivos bajo `root`."""
+    """Recursively iterates over all files under `root`."""
     for p in sorted(root.rglob("*")):
         if p.is_file():
             yield p
 
 
 def _notify_tray_show() -> None:
-    """Pide al tray que muestre la ventana. Si el tray no está corriendo,
-    no hace nada (la UI puede abrirse manualmente con csf-ui).
-    """
-    # Protocolo simple: el tray escucha un FIFO en $XDG_RUNTIME_DIR.
-    # Si no existe, lo creamos.
+    """Asks the tray to show its window. No-op if the tray isn't running."""
+    # The tray listens on a FIFO at $XDG_RUNTIME_DIR/csf-tray.sock.
     fifo = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "csf-tray.sock"
     if not fifo.exists():
         return
@@ -167,50 +165,50 @@ def _notify_tray_show() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────
-# Comandos
+# Commands
 # ─────────────────────────────────────────────────────────────────
 def cmd_copy(args: argparse.Namespace) -> int:
-    """`csf-thunar-helper copy <sources>...`: marca en el clipboard CSF.
+    """`csf-thunar-helper copy <sources>...`: marks files in the CSF clipboard.
 
-    NO encola todavía. El encolado real ocurre en `paste` cuando el
-    usuario elige la carpeta destino. Esto es el flujo TeraCopy.
+    Does NOT enqueue yet. The actual enqueue happens in `paste` when
+    the user picks the destination folder. This is the TeraCopy flow.
     """
     sources = [s for s in args.sources if os.path.exists(s)]
     if not sources:
-        print("csfd: ninguno de los paths existe", file=sys.stderr)
+        print("csfd: none of the paths exist", file=sys.stderr)
         return 1
     _save_clipboard("copy", sources)
-    print(f"csfd: {len(sources)} item(s) en clipboard CSF. Pegar con CopySecureFast en destino.")
+    print(f"csfd: {len(sources)} item(s) in CSF clipboard. Use Paste with CopySecureFast in the destination.")
     return 0
 
 
 def cmd_cut(args: argparse.Namespace) -> int:
-    """`csf-thunar-helper cut <sources>...`: marca en el clipboard CSF como move."""
+    """`csf-thunar-helper cut <sources>...`: marks files as move in the CSF clipboard."""
     sources = [s for s in args.sources if os.path.exists(s)]
     if not sources:
-        print("csfd: ninguno de los paths existe", file=sys.stderr)
+        print("csfd: none of the paths exist", file=sys.stderr)
         return 1
     _save_clipboard("cut", sources)
-    print(f"csfd: {len(sources)} item(s) marcados para mover. Pegar con CopySecureFast en destino.")
+    print(f"csfd: {len(sources)} item(s) marked for move. Use Paste with CopySecureFast in the destination.")
     return 0
 
 
 def cmd_paste(args: argparse.Namespace) -> int:
-    """`csf-thunar-helper paste <dest_dir>`: encola lo que esté en el clipboard CSF."""
+    """`csf-thunar-helper paste <dest_dir>`: enqueues whatever is in the CSF clipboard."""
     dest = args.dest
     sock = _find_socket()
     if sock is None:
-        print("csfd: daemon no disponible", file=sys.stderr)
+        print("csfd: daemon not available. Start it with `csfd`.", file=sys.stderr)
         return 2
     clip = _load_clipboard()
     if not clip["items"]:
-        print("csfd: clipboard CSF vacío. Hacé 'Copiar con CSF' primero.", file=sys.stderr)
+        print("csfd: CSF clipboard empty. Use 'Copy with CSF' first.", file=sys.stderr)
         return 1
     op = Operation.MOVE if clip["op"] == "cut" else Operation.COPY
     try:
         with DaemonClient(socket_path=sock) as c:
             _enqueue_paths(c, op, dest, clip["items"])
-            # Vaciar el clipboard después de pegar
+            # Empty the clipboard after pasting.
             if op == Operation.MOVE:
                 _save_clipboard("copy", [])
     except DaemonConnectionError as e:
@@ -221,10 +219,10 @@ def cmd_paste(args: argparse.Namespace) -> int:
 
 
 def cmd_queue(_args) -> int:
-    """Abre la ventana flotante (csf-ui)."""
+    """Opens the floating queue window (csf-ui)."""
     sock = _find_socket()
     if sock is None:
-        print("csfd: daemon no disponible", file=sys.stderr)
+        print("csfd: daemon not available", file=sys.stderr)
         return 2
     env = os.environ.copy()
     env["CSF_SOCKET"] = sock
@@ -233,26 +231,26 @@ def cmd_queue(_args) -> int:
         from csf_ui.main import main as csf_ui_main
         return csf_ui_main()
     except ImportError as e:
-        print(f"csfd: no se pudo abrir la UI ({e})", file=sys.stderr)
+        print(f"csfd: could not open UI ({e})", file=sys.stderr)
         return 3
 
 
 def cmd_status(_args) -> int:
     sock = _find_socket()
     if sock is None:
-        print("csfd: daemon no disponible", file=sys.stderr)
+        print("csfd: daemon not available", file=sys.stderr)
         return 2
     try:
         with DaemonClient(socket_path=sock) as c:
             jobs = c.get_queue()
             if not jobs:
-                print("csfd: cola vacía")
+                print("csfd: empty queue")
                 return 0
-            print(f"csfd: {len(jobs)} jobs en cola:")
+            print(f"csfd: {len(jobs)} job(s) in queue:")
             for j in jobs:
                 pct = f"{j.progress * 100:.0f}%" if j.total_bytes else "—"
                 err = f"  ERR: {j.error}" if j.error else ""
-                print(f"  [{j.state.value:10s}] {j.basename:30s} {pct:>5s}  {j.source} → {j.dest}{err}")
+                print(f"  [{j.state.value:10s}] {j.basename:30s} {pct:>5s}  {j.source} -> {j.dest}{err}")
     except DaemonConnectionError as e:
         print(f"csfd: {e}", file=sys.stderr)
         return 2
@@ -262,12 +260,12 @@ def cmd_status(_args) -> int:
 def cmd_ping(_args) -> int:
     sock = _find_socket()
     if sock is None:
-        print("csfd: daemon no disponible", file=sys.stderr)
+        print("csfd: daemon not available", file=sys.stderr)
         return 2
     try:
         with DaemonClient(socket_path=sock) as c:
             if c.ping():
-                print("csfd: pong (daemon vivo)")
+                print("csfd: pong (daemon alive)")
                 return 0
             return 1
     except DaemonConnectionError as e:
@@ -278,12 +276,12 @@ def cmd_ping(_args) -> int:
 def cmd_throttle(args) -> int:
     sock = _find_socket()
     if sock is None:
-        print("csfd: daemon no disponible", file=sys.stderr)
+        print("csfd: daemon not available", file=sys.stderr)
         return 2
     try:
         with DaemonClient(socket_path=sock) as c:
             applied = c.set_throttle(args.bytes_per_second)
-            print(f"csfd: throttle aplicado = {applied} B/s")
+            print(f"csfd: throttle applied = {applied} B/s")
     except DaemonConnectionError as e:
         print(f"csfd: {e}", file=sys.stderr)
         return 2
@@ -296,37 +294,36 @@ def cmd_throttle(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="csf-thunar-helper",
-        description="Helper CLI de CopySecureFast (integración con Thunar y otros)",
+        description="CopySecureFast CLI helper (Thunar/file manager integration)",
     )
     sub = p.add_subparsers(dest="command", required=True)
 
-    sp = sub.add_parser("copy", help="Copiar con CopySecureFast (Thunar usa %%F y carpeta destino)")
-    sp.add_argument("sources", nargs="+", help="Sources y destino")
+    sp = sub.add_parser("copy", help="Copy with CopySecureFast (Thunar uses %%F and target folder)")
+    sp.add_argument("sources", nargs="+", help="Sources and destination")
     sp.set_defaults(func=cmd_copy)
 
-    sp = sub.add_parser("cut", help="Mover con CopySecureFast (Thunar usa %%F y carpeta destino)")
-    sp.add_argument("sources", nargs="+", help="Sources y destino")
+    sp = sub.add_parser("cut", help="Move with CopySecureFast (Thunar uses %%F and target folder)")
+    sp.add_argument("sources", nargs="+", help="Sources and destination")
     sp.set_defaults(func=cmd_cut)
 
-    sp = sub.add_parser("paste", help="Pegar con CopySecureFast (clipboard CSF)")
-    sp.add_argument("dest", help="Carpeta destino")
+    sp = sub.add_parser("paste", help="Paste with CopySecureFast (CSF clipboard)")
+    sp.add_argument("dest", help="Destination folder")
     sp.set_defaults(func=cmd_paste)
 
-    sp = sub.add_parser("queue", help="Abrir la ventana flotante de cola")
+    sp = sub.add_parser("queue", help="Open the floating queue window")
     sp.set_defaults(func=cmd_queue)
 
-    sp = sub.add_parser("status", help="Mostrar la cola en formato texto")
+    sp = sub.add_parser("status", help="Show the queue as text")
     sp.set_defaults(func=cmd_status)
 
-    sp = sub.add_parser("ping", help="Health check del daemon")
+    sp = sub.add_parser("ping", help="Daemon health check")
     sp.set_defaults(func=cmd_ping)
 
-    sp = sub.add_parser("throttle", help="Ajustar limitador de velocidad (B/s)")
-    sp.add_argument("bytes_per_second", type=int, help="0 = sin límite")
+    sp = sub.add_parser("throttle", help="Set speed limit (B/s)")
+    sp.add_argument("bytes_per_second", type=int, help="0 = unlimited")
     sp.set_defaults(func=cmd_throttle)
 
     return p
-
 
 def main() -> int:
     parser = build_parser()
