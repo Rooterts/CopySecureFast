@@ -230,12 +230,12 @@ CopySecureFast/
 | Fase | Objetivo                                          | Estado        |
 |------|---------------------------------------------------|---------------|
 | 1    | Boceto de arquitectura + documento de contexto    | ✅ definido   |
-| 2    | Spike del backend Rust: copia básica + cola SQLite + socket Unix | ⏳ pendiente  |
-| 3    | Spike csf_client + csf_ui (UI compartida, JSON-RPC)| ⏳ pendiente  |
+| 2    | Spike del backend Rust: copia básica + cola SQLite + socket Unix | ✅ hecho |
+| 3    | Spike csf_client + csf_ui (UI compartida, JSON-RPC)| ✅ hecho      |
 | 4    | Adaptador Nemo (libnemo-extension) + cola + dialog| ⏳ pendiente  |
-| 5    | Adaptador Nautilus/Caja + Adaptador Thunar        | ⏳ pendiente  |
-| 6    | MVP integrado (progreso, pausa, conflictos, hash)  | ⏳ pendiente  |
-| 7    | Limitador de velocidad + vista Quick-Look + Dolphin (.desktop)    | ⏳ pendiente  |
+| 5    | Adaptador Nautilus/Caja + Adaptador Thunar        | 🟡 Thunar ✅, Nautilus pendiente |
+| 6    | MVP integrado (progreso, pausa, conflictos, hash)  | 🟡 parcial: progreso+hash ✅, pausa/cancel/conflictos pendiente |
+| 7    | Limitador de velocidad + vista Quick-Look + Dolphin (.desktop)    | 🟡 throttle ✅, Quick-Look + Dolphin pendiente |
 | 8    | Cifrado AES-256 + soporte SMB/NFS/ssh             | ⏳ pendiente  |
 | 9    | Pulido UI, notificaciones, empaquetado .deb       | ⏳ pendiente  |
 
@@ -278,3 +278,29 @@ CopySecureFast/
   automática de gestores en `postinst`. Dolphin se integra vía KDE ServiceMenus
   (`.desktop` con `Exec=`), no API de extensión. Cartera de fases ampliada de 8
   a 9 para incorporar los adaptadores adicionales explícitamente.
+- **2026-07-07** — Fases 2 y 3 + Thunar de Fase 5 implementadas en una sesión.
+  Decisiones/pivotes que cambiaron el plan original:
+  - **SQLite Send**: `rusqlite::Connection` no es `Send` → tuvimos que envolver
+    en `Mutex<Connection>` para que el `tokio::spawn` del RPC server compile.
+  - **Sin `libc`/`filetime`**: el plan original los incluía, pero `filetime 0.4`
+    no existe en crates.io y `libc::EXDEV` se reemplaza con un fallback
+    copy+unlink genérico.
+  - **Tag-content serde**: el cliente Python aprendió que cuando un `Request`
+    variant no tiene fields (como `Ping`), NO se debe enviar la clave `params`
+    (sino `{}`), porque serde con `tag = "method"` rechaza unit variants con
+    content. Documentado en `csf_client/daemon.py`.
+  - **Adaptador Thunar vía .uca, no thunarx-python**: la extensión thunarx
+    Python requeriría `thunarx-python` (AUR en Arch). El sistema nativo
+    "Custom Actions" (`.uca.xml`) funciona sin instalar nada y es la vía que
+    terminamos adoptando. La extensión thunarx Python igual está escrita en
+    `thunar-extension/copysecurefast/extension.py` para quien quiera usarla.
+  - **Wrapper global**: instalamos un wrapper en `~/.local/bin/csf-thunar-helper`
+    que apunta al script del repo. Sin sudo, sin paquete Debian aún.
+  - **Auto-discovery de socket**: el helper busca en
+    `CSF_SOCKET > XDG_RUNTIME_DIR > /run/user/UID > /tmp` para que funcione
+    sin tener que exportar variables.
+  - **Self-copy + colisiones**: el helper detecta origen==destino y renombra
+    automáticamente las colisiones (`foo (1).txt`) para no perder datos.
+  - **GtkListView manual refresh**: PyGObject no permite GObject.Binding
+    cuando un lado es una dataclass, así que el `JobRow` (GObject) envuelve
+    al `JobItem` (dataclass) y los bindings van a través del wrapper.
