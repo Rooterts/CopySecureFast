@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<actions>
+  <!-- Acción previa: abrir terminal en directorio -->
+  <action>
+    <icon>utilities-terminal</icon>
+    <name>Open Terminal Here</name>
+    <unique-id>1761235802726116-1</unique-id>
+    <command>kitty</command>
+    <description>Open kitty terminal in this directory</description>
+    <patterns>*</patterns>
+    <directories/>
+  </action>
+
+  <!-- CopySecureFast: copia/movimiento seguro vía daemon -->
+  <action>
+    <icon>edit-copy</icon>
+    <name>Copiar con CopySecureFast</name>
+    <unique-id>csf-copy</unique-id>
+    <description>Encolar una copia segura (verificable) en el daemon CSF</description>
+    <command>csf-thunar-helper copy %F</command>
+    <patterns>*</patterns>
+    <directories/>
+    <other-files/>
+    <text-files/>
+    <image-files/>
+    <audio-files/>
+    <video-files/>
+  </action>
+
+  <action>
+    <icon>edit-cut</icon>
+    <name>Mover con CopySecureFast</name>
+    <unique-id>csf-move</unique-id>
+    <description>Encolar un movimiento seguro en el daemon CSF</description>
+    <command>csf-thunar-helper move %F</command>
+    <patterns>*</patterns>
+    <directories/>
+    <other-files/>
+    <text-files/>
+    <image-files/>
+    <audio-files/>
+    <video-files/>
+  </action>
+
+  <action>
+    <icon>view-list-symbolic</icon>
+    <name>Ver cola de CopySecureFast</name>
+    <unique-id>csf-queue</unique-id>
+    <description>Abrir la ventana de cola con los trabajos en curso</description>
+    <command>csf-thunar-helper queue</command>
+    <patterns>*</patterns>
+    <directories/>
+    <other-files/>
+    <text-files/>
+    <image-files/>
+    <audio-files/>
+    <video-files/>
+  </action>
+
+  <action>
+    <icon>preferences-system-network</icon>
+    <name>CSF: estado del daemon</name>
+    <unique-id>csf-status</unique-id>
+    <description>Mostrar el estado de la cola y del daemon en una notificación</description>
+    <command>sh -c 'csf-thunar-helper status | xargs -I{} notify-send "CopySecureFast" "{}" || true'</command>
+    <patterns>*</patterns>
+    <directories/>
+    <other-files/>
+    <text-files/>
+    <image-files/>
+    <audio-files/>
+    <video-files/>
+  </action>
+</actions>
