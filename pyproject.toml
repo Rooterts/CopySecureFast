@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csf-client"
+version = "0.1.0"
+description = "Cliente Python para el daemon CopySecureFast (csfd)"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "CopySecureFast contributors" }]
+keywords = ["copy", "queue", "thunar", "nautilus", "nemo", "file-manager"]
+
+[project.optional-dependencies]
+ui = ["PyGObject>=3.50"]
+test = ["pytest>=7"]
+
+[project.scripts]
+csf-ui = "csf_ui.main:main"
+
+[tool.setuptools.packages.find]
+include = ["csf_client*", "csf_ui*"]
