@@ -1,0 +1,36 @@
+#!/bin/sh
+# csfd-tray: tray icon de CopySecureFast.
+# Lanza la app GTK4 con AyatanaAppIndicator3 que vive en el system tray
+# y muestra/oculta la ventana flotante de cola al hacer click.
+#
+# Acepta: --socket=<path> para override del socket del daemon.
+
+# Resolver directorio del script (sigue symlinks).
+script="$0"
+while [ -L "$script" ]; do
+    target="$(readlink "$script")"
+    case "$target" in
+        /*) script="$target" ;;
+        *) script="$(dirname "$script")/$target" ;;
+    esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$script")" && pwd)"
+
+# Si no encontramos csf_ui/tray.py en $SCRIPT_DIR/.., buscar hacia arriba
+# (caso de instalación tipo ~/.local/bin/csfd-tray apuntando a un symlink
+# en /usr/bin/ o similar).
+REPO="$SCRIPT_DIR"
+while [ ! -d "$REPO/csf_ui" ] && [ "$REPO" != "/" ]; do
+    REPO="$(dirname "$REPO")"
+done
+if [ ! -d "$REPO/csf_ui" ]; then
+    echo "csfd-tray: no se encontró csf_ui/ cerca de $SCRIPT_DIR" >&2
+    exit 1
+fi
+
+# Agregar el repo a PYTHONPATH para que csf_client y csf_ui sean importables
+# sin necesidad de `pip install`.
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+export CSF_SOCKET="${CSF_SOCKET:-/tmp/copysecurefast.sock}"
+
+exec python3 "$REPO/csf_ui/tray.py" "$@"

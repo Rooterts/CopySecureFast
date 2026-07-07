@@ -1,199 +1,306 @@
-"""csfd-tray: app GTK4 con StatusIcon en el system tray.
+"""csfd-tray: app GTK3 con AyatanaAppIndicator3 (system tray).
 
 Click en el tray icon: muestra/oculta la ventana flotante de cola.
 Click derecho: menú con "Mostrar cola", "Pausar todo", "Reanudar todo",
 "Cancelar todo", "Salir".
 
-Proceso ligero: solo maneja el tray + un puntero a la ventana.
+NOTA: AyatanaAppIndicator3 requiere Gtk 3.0 (no 4.0). Por eso este binario
+usa Gtk 3 en lugar de Gtk 4. La ventana flotante también es Gtk 3
+(la versión Gtk 4 de csf_ui/queue_window.py no se usa acá).
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import gi
 
-gi.require_version("Gtk", "4.0")
-gi.require_version("Adw", "1")
+# Importante: AyatanaAppIndicator3 SÓLO funciona con Gtk 3.
+# Si se carga Gtk 4 antes, falla el import del indicator.
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
 
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gtk  # noqa: E402
+from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 
-from csf_client import DaemonClient, DaemonConnectionError
-from csf_ui.queue_window import QueueWindow
+# Asegurar que csf_client y csf_ui sean importables
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
+from csf_client import DaemonClient, DaemonConnectionError  # noqa: E402
 
 APP_ID = "io.github.copysecurefast.tray"
-SOCKET = os.environ.get("CSF_SOCKET")
 
 
-class TrayApp(Adw.Application):
+def _format_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        n = n / 1024.0
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} PiB"
+
+
+def _format_speed(bps: float) -> str:
+    if bps < 1:
+        return "—"
+    return f"{_format_bytes(int(bps))}/s"
+
+
+class TrayApp:
+    """Aplicación GTK3 con system tray icon."""
+
+    POLL_INTERVAL_MS = 500
+
     def __init__(self, socket_path: str | None = None):
-        super().__init__(
-            application_id=APP_ID,
-            flags=Gio.ApplicationFlags.FLAGS_NONE,
-        )
         self._socket_path = socket_path
-        self._win: QueueWindow | None = None
-        self._tray: Gtk.StatusIcon | None = None
+        self._client: DaemonClient | None = None
+        self._win: Gtk.Window | None = None
+        self._tray: AppIndicator.Indicator | None = None
+        self._rows: dict = {}
+        self._last_status_text: str = ""
+        self._last_total_bytes: int = 0
+        self._last_copied: int = 0
+        self._last_ts: float | None = None
+        self._speed_bps: float = 0.0
+        self._eta_s: float = 0.0
 
-    def do_activate(self):
-        # La ventana se crea lazily (al primer click del tray).
-        pass
-
-    def do_startup(self):
-        Adw.Application.do_startup(self)
+    def run(self):
+        """Construye el tray y entra en el main loop."""
         self._build_tray()
-        # Si el usuario ya tenía la ventana abierta (ej. csf-ui lanzado
-        # por separado), la conectamos al singleton.
-        for w in self.get_windows():
-            if isinstance(w, QueueWindow):
-                self._win = w
-                break
+        # Conectar al daemon (en background via GLib timeout)
+        if self._socket_path is None:
+            from csf_client.daemon import _default_socket_path
+            self._socket_path = _default_socket_path()
+        try:
+            self._client = DaemonClient(socket_path=self._socket_path)
+        except DaemonConnectionError as e:
+            print(f"[csfd-tray] no se pudo conectar al daemon: {e}", file=sys.stderr)
+
+        # Polling inicial: cada 500ms refresca el status y la ventana si está abierta
+        from gi.repository import GLib
+        GLib.timeout_add(self.POLL_INTERVAL_MS, self._on_tick)
+        Gtk.main()
 
     def _build_tray(self):
-        """Crea el StatusIcon."""
-        # GTK4 no tiene Gtk.StatusIcon estable; usamos un botón en un
-        # popover-like via SystemTray. Como GTK4 todavía no expone
-        # StatusNotifierItem nativamente en esta versión, recurrimos
-        # al AppIndicator3 via GObject introspection si está disponible.
-        # Si no, fallback: usamos una ventana invisible + un tray simulado.
-        #
-        # En la práctica, en CachyOS con un tray real (waybar, niri-dms,
-        # etc.) queremos que aparezca un icono. GTK4 sólo lo expone a
-        # través de libayatana-appindicator. Si no está, mostramos un
-        # fallback: una mini-ventana con el icono + menú.
-        try:
-            gi.require_version("AyatanaAppIndicator3", "0.1")
-            from gi.repository import AyatanaAppIndicator3 as AppIndicator
-        except (ValueError, ImportError):
-            self._tray = None
-            self._build_fallback_window()
-            return
-
+        """Crea el status icon."""
         self._tray = AppIndicator.Indicator.new(
             "copysecurefast",
-            "folder-copy-symbolic",
+            "folder-copy",  # nombre de icono estándar de Gtk
             AppIndicator.IndicatorCategory.APPLICATION_STATUS,
         )
         self._tray.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self._tray.set_title("CopySecureFast")
 
         menu = Gtk.Menu()
-        item_show = Gtk.MenuItem(label="Mostrar cola")
-        item_show.connect("activate", lambda *_: self._toggle_window())
-        item_show.show()
-        menu.append(item_show)
 
+        def add_item(label, callback):
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda *_: callback())
+            item.show()
+            menu.append(item)
+            return item
+
+        add_item("Mostrar cola", self._show_window)
         menu.append(Gtk.SeparatorMenuItem())
-
-        item_pause = Gtk.MenuItem(label="Pausar todo")
-        item_pause.connect("activate", self._menu_pause_all)
-        item_pause.show()
-        menu.append(item_pause)
-
-        item_resume = Gtk.MenuItem(label="Reanudar todo")
-        item_resume.connect("activate", self._menu_resume_all)
-        item_resume.show()
-        menu.append(item_resume)
-
-        item_cancel = Gtk.MenuItem(label="Cancelar todo")
-        item_cancel.connect("activate", self._menu_cancel_all)
-        item_cancel.show()
-        menu.append(item_cancel)
-
+        add_item("Pausar todo", self._pause_all)
+        add_item("Reanudar todo", self._resume_all)
+        add_item("Cancelar todo", self._cancel_all)
         menu.append(Gtk.SeparatorMenuItem())
-
-        item_quit = Gtk.MenuItem(label="Salir")
-        item_quit.connect("activate", lambda *_: self.quit())
-        item_quit.show()
-        menu.append(item_quit)
+        add_item("Salir", Gtk.main_quit)
 
         self._tray.set_menu(menu)
-        # Click izquierdo toggle ventana
+        # El activate en AppIndicator no es estándar. El menú cubre el toggle.
+
+    def _on_tick(self) -> bool:
+        """Refresca el status y la ventana si está abierta."""
+        if self._client is None:
+            return True
         try:
-            self._tray.connect("activate", self._on_tray_activated)
-        except Exception:
-            pass
+            jobs = self._client.get_queue()
+        except DaemonConnectionError:
+            return True
+        except Exception as e:
+            print(f"[csfd-tray] tick error: {e}", file=sys.stderr)
+            return True
 
-    def _build_fallback_window(self):
-        """Fallback: mini-ventana siempre visible con el menú.
+        # Calcular velocidad global
+        now = self._now()
+        total_copied = sum(j.copied_bytes for j in jobs)
+        total_bytes = sum(j.total_bytes for j in jobs)
+        active = sum(1 for j in jobs if j.state.value == "running")
+        pending = sum(1 for j in jobs if j.state.value == "pending")
+        failed = sum(1 for j in jobs if j.state.value == "failed")
 
-        Si no hay appindicator, mostramos una ventanita chiquita arriba
-        a la derecha que reemplaza al tray. Funcional pero menos elegante.
-        """
-        win = Gtk.ApplicationWindow(application=self)
-        win.set_title("CSF Tray")
-        win.set_default_size(0, 0)
-        win.set_decorated(False)
-        win.set_resizable(False)
-        # Esquina superior derecha
-        display = Gtk.Widget.get_default_direction()
-        win.set_visible(True)
-        self._tray = None  # signal que no hay tray real
-        # Construimos la ventana flotante igual; el usuario la abre
-        # desde un .desktop manual o la deja como ventana normal.
-        self._show_queue_window()
+        if self._last_ts is not None:
+            dt = now - self._last_ts
+            if dt > 0.1:
+                dbytes = total_copied - self._last_copied
+                if dbytes >= 0:
+                    self._speed_bps = dbytes / dt
+                # ETA
+                remaining = max(0, total_bytes - total_copied)
+                if self._speed_bps > 1 and remaining > 0:
+                    self._eta_s = remaining / self._speed_bps
+                else:
+                    self._eta_s = 0
+        self._last_ts = now
+        self._last_copied = total_copied
 
-    def _on_tray_activated(self, _tray):
-        # Algunos appindicators no emiten activate. El menú ya
-        # cubre el toggle.
-        self._toggle_window()
-
-    def _toggle_window(self):
-        if self._win is None:
-            self._show_queue_window()
-        elif self._win.get_visible():
-            self._win.set_visible(False)
+        # Texto del status (lo usa la ventana flotante)
+        if not jobs:
+            self._last_status_text = "Sin trabajos en cola"
         else:
-            self._win.present()
+            n = len(jobs)
+            txt = f"{n} trabajo(s) — {active} activo(s), {pending} pendiente(s)"
+            if failed:
+                txt += f" — {failed} fallaron"
+            self._last_status_text = txt
 
-    def _show_queue_window(self):
+        # Actualizar tooltip del tray
+        if self._tray is not None:
+            tooltip = self._last_status_text
+            if self._speed_bps > 1 and active:
+                tooltip += f"  ·  {_format_speed(self._speed_bps)}"
+            self._tray.set_title(f"CSF: {tooltip}")
+
+        # Si la ventana flotante está abierta, refrescarla
+        if self._win is not None and self._win.get_visible():
+            self._refresh_window(jobs)
+
+        return True  # continuar
+
+    def _now(self) -> float:
+        from gi.repository import GLib
+        return GLib.get_monotonic_time() / 1_000_000.0
+
+    def _show_window(self):
         if self._win is None:
-            self._win = QueueWindow(self, socket_path=self._socket_path)
-            self._win.connect("notify::visible", self._on_window_visible)
+            self._build_window()
         self._win.present()
+        return None
 
-    def _on_window_visible(self, _win, _pspec):
-        # Si el usuario cierra la ventana con la X, queda oculta pero
-        # viva. Si quiere salir completamente, usa el menú "Salir".
-        pass
+    def _build_window(self):
+        """Construye la ventana flotante (Gtk 3 simple)."""
+        self._win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self._win.set_title("CopySecureFast — Cola")
+        self._win.set_default_size(380, 320)
+        self._win.set_resizable(True)
+        self._win.set_position(Gtk.WindowPosition.MOUSE)
 
-    # ── Menu actions ────────────────────────────────────────────────
-    def _menu_pause_all(self, *_):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        vbox.set_border_width(10)
+        self._win.add(vbox)
+
+        # Status label
+        self._status_lbl = Gtk.Label(label="Sin trabajos en cola")
+        self._status_lbl.set_halign(Gtk.Align.START)
+        vbox.pack_start(self._status_lbl, False, False, 0)
+
+        # Global progress
+        self._global_prog = Gtk.ProgressBar()
+        self._global_prog.set_fraction(0.0)
+        vbox.pack_start(self._global_prog, False, False, 0)
+
+        # Meta
+        self._meta_lbl = Gtk.Label(label="—")
+        self._meta_lbl.set_halign(Gtk.Align.END)
+        vbox.pack_start(self._meta_lbl, False, False, 0)
+
+        # Separator
+        vbox.pack_start(Gtk.Separator(), False, False, 4)
+
+        # Scrolled list
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_size_request(-1, 180)
+        vbox.pack_start(scrolled, True, True, 0)
+
+        self._list_store = Gtk.ListStore(str, str, float, str)  # name, state, progress, status
+        treeview = Gtk.TreeView(model=self._list_store)
+        treeview.set_headers_visible(False)
+
+        for i, title in enumerate(["Archivo", "Estado", "Progreso", "Info"]):
+            renderer = Gtk.CellRendererText()
+            if i == 2:  # progress
+                renderer = Gtk.CellRendererProgress()
+            col = Gtk.TreeViewColumn(title, renderer)
+            if i == 2:
+                col.add_attribute(renderer, "value", 2)
+            else:
+                col.add_attribute(renderer, "text", i)
+            treeview.append_column(col)
+
+        scrolled.add(treeview)
+        self._treeview = treeview
+        self._win.show_all()
+
+    def _refresh_window(self, jobs):
+        if self._win is None:
+            return
+        self._status_lbl.set_text(self._last_status_text)
+        # Meta
+        meta = _format_speed(self._speed_bps)
+        if self._eta_s > 0 and any(j.state.value == "running" for j in jobs):
+            meta += f"  ·  ETA {int(self._eta_s // 60)}m {int(self._eta_s % 60)}s"
+        self._meta_lbl.set_text(meta)
+        # Global progress
+        total_bytes = sum(j.total_bytes for j in jobs)
+        total_copied = sum(j.copied_bytes for j in jobs)
+        if total_bytes > 0:
+            self._global_prog.set_fraction(min(1.0, total_copied / total_bytes))
+        # List
+        self._list_store.clear()
+        for j in jobs:
+            pct = (j.copied_bytes / j.total_bytes * 100) if j.total_bytes else 0
+            state_lbl = {
+                "pending": "Pendiente",
+                "running": "Copiando",
+                "paused": "Pausado",
+                "completed": "Completado",
+                "failed": "Falló",
+                "cancelled": "Cancelado",
+            }.get(j.state.value, j.state.value)
+            self._list_store.append([j.basename, state_lbl, pct, f"{int(pct)}%"])
+
+    def _pause_all(self):
+        if self._client is None:
+            return
         try:
-            with DaemonClient(socket_path=self._socket_path) as c:
-                c.pause()
+            self._client.pause()
         except DaemonConnectionError as e:
-            self._notify(f"Pausa falló: {e}")
+            print(f"[csfd-tray] pause: {e}", file=sys.stderr)
 
-    def _menu_resume_all(self, *_):
+    def _resume_all(self):
+        if self._client is None:
+            return
         try:
-            with DaemonClient(socket_path=self._socket_path) as c:
-                c.resume()
+            self._client.resume()
         except DaemonConnectionError as e:
-            self._notify(f"Resume falló: {e}")
+            print(f"[csfd-tray] resume: {e}", file=sys.stderr)
 
-    def _menu_cancel_all(self, *_):
+    def _cancel_all(self):
+        if self._client is None:
+            return
         try:
-            with DaemonClient(socket_path=self._socket_path) as c:
-                c.cancel()
+            self._client.cancel()
         except DaemonConnectionError as e:
-            self._notify(f"Cancel falló: {e}")
-
-    def _notify(self, msg: str):
-        # Sin notify-send en deps; lo escribimos a stderr y el usuario lo ve.
-        sys.stderr.write(f"[csfd-tray] {msg}\n")
+            print(f"[csfd-tray] cancel: {e}", file=sys.stderr)
 
 
 def main() -> int:
     sock = os.environ.get("CSF_SOCKET")
-    if not sock:
-        for arg in sys.argv[1:]:
-            if arg.startswith("--socket="):
-                sock = arg.split("=", 1)[1]
+    for arg in sys.argv[1:]:
+        if arg.startswith("--socket="):
+            sock = arg.split("=", 1)[1]
     app = TrayApp(socket_path=sock)
-    return app.run(sys.argv)
+    app.run()
+    return 0
 
 
 if __name__ == "__main__":

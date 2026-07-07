@@ -1,7 +1,8 @@
 //! CopySecureFast daemon — entry point.
 //!
 //! Inicializa logging, abre la DB SQLite, levanta el servidor JSON-RPC
-//! sobre socket Unix y mantiene un worker loop que procesa jobs pending.
+//! sobre socket Unix, mantiene un worker loop que procesa jobs pending
+//! y opcionalmente auto-arranca `csfd-tray` para tener un tray icon.
 //!
 //! Rutas por defecto (resolubles vía env vars o paths estándar):
 //! - Socket: `XDG_RUNTIME_DIR/copysecurefast.sock` (fallback `/tmp/copysecurefast.sock`)
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tracing::{error, info, warn, Level};
+use tracing::{error, info, warn};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -96,6 +97,47 @@ fn socket_path() -> PathBuf {
     runtime_dir().join(DEFAULT_SOCKET_NAME)
 }
 
+/// Busca el binario csfd-tray. Orden:
+/// 1) `$HOME/.local/bin/csfd-tray` (wrapper que el repo provee)
+/// 2) `$PATH` (cualquier csfd-tray ejecutable)
+/// 3) Junto al binario actual de csfd (instalación via cargo)
+fn find_tray_binary() -> PathBuf {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/csfd-tray"));
+    }
+    candidates.push(PathBuf::from("csfd-tray"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("csfd-tray"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("csfd-tray"))
+}
+
+fn spawn_tray(socket: &str) -> std::io::Result<u32> {
+    use std::process::{Command, Stdio};
+    let tray_bin = find_tray_binary();
+    if !tray_bin.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("csfd-tray no encontrado (buscado: ~/.local/bin/csfd-tray, $PATH, junto al binario)"),
+        ));
+    }
+    Command::new(&tray_bin)
+        .arg("--socket")
+        .arg(socket)
+        .env("CSF_SOCKET", socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|c| c.id())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
@@ -110,18 +152,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => db_path(),
     };
 
+    let want_tray = args.with_tray && !args.no_tray;
     info!(
         version = env!("CARGO_PKG_VERSION"),
         socket = %sock,
         db = %db_p.display(),
-        with_tray = args.with_tray && !args.no_tray,
+        with_tray = want_tray,
         "csfd starting"
     );
 
     let db = Arc::new(QueueDb::new(&db_p)?);
     let rpc = Arc::new(RpcServer::new(db.clone()));
 
-    // Worker loop
+    // Worker loop: procesa jobs pending
     {
         let db_w = db.clone();
         let server_w = rpc.clone();
@@ -130,39 +173,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // Tray icon (default: sí). Lanza el binario `csfd-tray` que es la
-    // app GTK4 con el status icon. Si el binario no existe, log warning
-    // y continúa (modo headless).
-    let want_tray = args.with_tray && !args.no_tray;
+    // Tray icon (default: sí). Si no se puede iniciar, log warning y
+    // continúa (modo headless; --no-tray para silenciar el warning).
     if want_tray {
         match spawn_tray(&sock) {
-            Ok(pid) => info!(pid, "csfd-tray spawned"),
-            Err(e) => warn!("no se pudo iniciar csfd-tray: {} (continuando sin tray)", e),
+            Ok(pid) => info!(pid, "csfd-tray spawned (system tray activo)"),
+            Err(e) => warn!(
+                "no se pudo iniciar csfd-tray: {} (continuando sin tray; usá --no-tray para silenciar)",
+                e
+            ),
         }
     }
 
     rpc.clone().run(sock).await
-}
-
-fn spawn_tray(socket: &str) -> std::io::Result<u32> {
-    use std::process::Command;
-    // Buscar csfd-tray: 1) junto al binario actual, 2) en $PATH
-    let exe = std::env::current_exe()?;
-    let dir = exe.parent().unwrap_or(std::path::Path::new("."));
-    let tray_path = dir.join("csfd-tray");
-    let candidate = if tray_path.exists() {
-        tray_path
-    } else {
-        PathBuf::from("csfd-tray")
-    };
-
-    Command::new(&candidate)
-        .arg("--socket")
-        .arg(socket)
-        .env("CSF_SOCKET", socket)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|c| c.id())
 }
