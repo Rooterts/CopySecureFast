@@ -17,6 +17,7 @@ test = ["pytest>=7"]
 
 [project.scripts]
 csf-ui = "csf_ui.main:main"
+csfd-tray = "csf_ui.tray:main"
 
 [tool.setuptools.packages.find]
 include = ["csf_client*", "csf_ui*"]

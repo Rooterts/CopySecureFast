@@ -69,13 +69,11 @@ class TestProtocol(unittest.TestCase):
         j = JobItem(id="x", source="/a", dest="/b", op=Operation.COPY, state=JobState.PENDING)
         self.assertEqual(j.progress, 0.0)
 
-    def test_job_item_terminal_states(self):
+    def test_job_state_terminal(self):
         for s in (JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED):
-            j = JobItem(id="x", source="/a", dest="/b", op=Operation.COPY, state=s)
-            self.assertTrue(j.is_terminal, f"{s} debería ser terminal")
+            self.assertTrue(s.is_terminal, f"{s} debería ser terminal")
         for s in (JobState.PENDING, JobState.RUNNING, JobState.PAUSED):
-            j = JobItem(id="x", source="/a", dest="/b", op=Operation.COPY, state=s)
-            self.assertFalse(j.is_terminal, f"{s} NO debería ser terminal")
+            self.assertFalse(s.is_terminal, f"{s} NO debería ser terminal")
 
     def test_basename(self):
         j = JobItem(

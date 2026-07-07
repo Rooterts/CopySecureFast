@@ -15,6 +15,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 filetime = "0.2"
 dirs = "6"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
 
 [lib]
 path = "src/lib.rs"

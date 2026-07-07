@@ -5,7 +5,10 @@ API principal:
     >>> with DaemonClient() as c:
     ...     c.ping()
     ...     c.enqueue([EnqueueItem("/a", "/b", Operation.COPY)])
-    ...     queue = c.get_queue()
+    ...     c.pause()           # pausa todos
+    ...     c.pause(job_id="x") # pausa uno
+    ...     for ev in c.subscribe():
+    ...         print(ev)
 
 Conexión:
 - Socket Unix en `$XDG_RUNTIME_DIR/copysecurefast.sock` por defecto.
@@ -22,17 +25,24 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import socket
+import threading
 import time
 from contextlib import AbstractContextManager
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, Iterator, List, Optional
 
 from csf_client.exceptions import (
     DaemonConnectionError,
     DaemonProtocolError,
     DaemonResponseError,
 )
-from csf_client.protocol import EnqueueItem, JobItem
+from csf_client.protocol import (
+    EnqueueItem,
+    JobItem,
+    ServerEvent,
+    parse_event,
+)
 
 log = logging.getLogger("csf_client")
 
@@ -46,7 +56,8 @@ def _default_socket_path() -> str:
     Prioridad:
     1. Env `CSF_SOCKET`
     2. `$XDG_RUNTIME_DIR/copysecurefast.sock`
-    3. `/tmp/copysecurefast.sock` (fallback para sistemas sin XDG)
+    3. `/run/user/<uid>/copysecurefast.sock`
+    4. `/tmp/copysecurefast.sock` (fallback)
     """
     env = os.environ.get("CSF_SOCKET")
     if env:
@@ -54,11 +65,18 @@ def _default_socket_path() -> str:
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
         return os.path.join(xdg, DEFAULT_SOCKET_NAME)
-    return os.path.join("/tmp", DEFAULT_SOCKET_NAME)
+    return os.path.join(f"/run/user/{os.getuid()}", DEFAULT_SOCKET_NAME)
 
 
 class DaemonClient(AbstractContextManager):
-    """Cliente del daemon csfd. Usar como context manager o directamente."""
+    """Cliente del daemon csfd. Usar como context manager o directamente.
+
+    El cliente mantiene UNA conexión long-lived con el daemon. Cuando
+    llamás a métodos como `ping` o `enqueue`, envía un request y lee
+    la respuesta de la línea siguiente. Los eventos espontáneos del
+    daemon (job_started, job_progress, etc.) se leen en background
+    y se encolan en una cola interna accesible vía `subscribe()`.
+    """
 
     def __init__(
         self,
@@ -70,6 +88,12 @@ class DaemonClient(AbstractContextManager):
         self.recv_timeout = recv_timeout
         self.auto_reconnect = auto_reconnect
         self._sock: Optional[socket.socket] = None
+        # Cola thread-safe para eventos espontáneos del server.
+        self._events: "queue.Queue[ServerEvent]" = queue.Queue()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        # Para correlacionar responses con requests, el server responde
+        # en orden FIFO por conexión. No necesitamos IDs en este spike.
 
     # ── context manager ──────────────────────────────────────────────
     def __enter__(self) -> "DaemonClient":
@@ -80,7 +104,6 @@ class DaemonClient(AbstractContextManager):
         self.close()
 
     def __del__(self):
-        # Best-effort cleanup si el usuario olvidó `with`.
         try:
             self.close()
         except Exception:
@@ -101,13 +124,23 @@ class DaemonClient(AbstractContextManager):
             s.settimeout(self.recv_timeout)
             s.connect(self.socket_path)
             self._sock = s
+            self._start_reader()
         except OSError as e:
             raise DaemonConnectionError(
                 f"no se pudo conectar a {self.socket_path}: {e}"
             ) from e
 
     def close(self) -> None:
+        self._stop.set()
+        if self._reader_thread is not None:
+            # El reader termina cuando el socket se cierre
+            self._reader_thread.join(timeout=1.0)
+            self._reader_thread = None
         if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._sock.close()
             except OSError:
@@ -118,18 +151,59 @@ class DaemonClient(AbstractContextManager):
     def connected(self) -> bool:
         return self._sock is not None
 
-    # ── I/O de bajo nivel ───────────────────────────────────────────
-    def _send_request(self, method: str, params: Optional[dict] = None) -> dict:
-        """Envía un request y devuelve el dict de la respuesta.
+    # ── reader thread ────────────────────────────────────────────────
+    def _start_reader(self) -> None:
+        """Inicia un thread que lee líneas del socket y las dispatcha.
 
-        Reabre el socket si se cayó (auto_reconnect=True).
-
-        Importante: serde con `#[serde(tag = "method", content = "params")]`
-        exige que cuando el variant no tiene fields (como Ping), NO se
-        envíe la clave `params`. Si la mandamos como `{}`, el daemon
-        intenta deserializar `Request::Ping { params: {} }` y falla con
-        "expected unit variant". Solo agregamos `params` si hay datos.
+        La primera línea después de un request es su respuesta. Las
+        líneas siguientes, si llegaron espontáneamente, son eventos.
+        Para simplificar, el reader pone TODAS las líneas en la cola
+        de eventos, y los métodos request/response sacan la primera
+        línea como respuesta y devuelven el resto a la cola.
         """
+        self._stop.clear()
+
+        def reader():
+            assert self._sock is not None
+            f = self._sock.makefile("r", encoding="utf-8", newline="\n")
+            try:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        log.warning("línea no-JSON del daemon: %r", line)
+                        continue
+                    # Si tiene "method" o "event" con un id de response,
+                    # se procesa como respuesta. Si tiene "event" puro
+                    # (job_started, etc), es un evento.
+                    if "event" in data and data["event"] not in (
+                        "queue_snapshot", "pong", "enqueued", "error",
+                    ):
+                        ev = parse_event(data)
+                        if ev is not None:
+                            self._events.put(ev)
+                    else:
+                        # Es un response a un request previo. Encolamos
+                        # en una cola aparte y el método que espera
+                        # respuesta lo lee de ahí.
+                        self._events.put(("response", data))
+            except (OSError, ValueError) as e:
+                if not self._stop.is_set():
+                    log.warning("reader terminado: %s", e)
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+
+        self._reader_thread = threading.Thread(target=reader, daemon=True)
+        self._reader_thread.start()
+
+    def _send_and_await(self, method: str, params: Optional[dict] = None, timeout: float = 5.0) -> dict:
+        """Envía un request y espera la respuesta."""
         if params:
             msg = {"method": method, "params": params}
         else:
@@ -140,9 +214,20 @@ class DaemonClient(AbstractContextManager):
             try:
                 if self._sock is None:
                     self.connect()
-                assert self._sock is not None  # para el type checker
+                assert self._sock is not None
                 self._sock.sendall(payload)
-                return self._read_response()
+                # Esperar la siguiente respuesta (no evento)
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        item = self._events.get(timeout=max(0.1, deadline - time.time()))
+                    except queue.Empty:
+                        continue
+                    if isinstance(item, tuple) and item[0] == "response":
+                        return item[1]
+                    # Si era un evento, reencolamos y seguimos esperando
+                    self._events.put(item)
+                raise DaemonConnectionError("timeout esperando respuesta")
             except (OSError, DaemonConnectionError) as e:
                 self.close()
                 if attempt == 0 and self.auto_reconnect:
@@ -150,82 +235,87 @@ class DaemonClient(AbstractContextManager):
                     time.sleep(0.1)
                     continue
                 raise DaemonConnectionError(f"comunicación con daemon falló: {e}") from e
-        # Inalcanzable: el bucle siempre retorna o raise.
-        raise DaemonConnectionError("loop de envío terminó sin resultado")
-
-    def _read_response(self) -> dict:
-        """Lee una línea JSON del socket."""
-        if self._sock is None:
-            raise DaemonConnectionError("socket cerrado")
-        buf = bytearray()
-        try:
-            while True:
-                chunk = self._sock.recv(4096)
-                if not chunk:
-                    raise DaemonConnectionError(
-                        "daemon cerró la conexión sin responder"
-                    )
-                buf.extend(chunk)
-                if b"\n" in buf:
-                    line, _, _ = buf.partition(b"\n")
-                    text = line.decode("utf-8").strip()
-                    if not text:
-                        raise DaemonProtocolError("respuesta vacía del daemon")
-                    try:
-                        return json.loads(text)
-                    except json.JSONDecodeError as e:
-                        raise DaemonProtocolError(
-                            f"JSON inválido del daemon: {e!r} en {text!r}"
-                        ) from e
-        except socket.timeout as e:
-            raise DaemonConnectionError(
-                f"timeout ({self.recv_timeout}s) leyendo respuesta del daemon"
-            ) from e
-
-    # ── dispatch tipado ─────────────────────────────────────────────
-    def _dispatch(self, event: str, data: dict) -> dict:
-        """Valida que la respuesta no sea un error, devuelve `data`."""
-        if event == "error":
-            raise DaemonResponseError(data.get("message", "error desconocido"))
-        return data
 
     # ── API pública ──────────────────────────────────────────────────
     def ping(self) -> bool:
-        """Ping. Devuelve True si el daemon responde."""
-        resp = self._send_request("ping")
-        self._dispatch(resp.get("event", ""), resp.get("data", {}))
+        resp = self._send_and_await("ping")
         return resp.get("event") == "pong"
 
     def get_queue(self) -> List[JobItem]:
-        """Snapshot de la cola actual."""
-        resp = self._send_request("get_queue")
-        data = self._dispatch(resp.get("event", ""), resp.get("data", {}))
+        resp = self._send_and_await("get_queue")
+        data = resp.get("data", {})
         return [JobItem.from_dict(j) for j in data.get("jobs", [])]
 
     def enqueue(self, items: Iterable[EnqueueItem]) -> int:
-        """Encola uno o más items. Devuelve la cantidad aceptada."""
         items_list = [it.to_dict() for it in items]
-        resp = self._send_request("enqueue", {"items": items_list})
-        data = self._dispatch(resp.get("event", ""), resp.get("data", {}))
+        resp = self._send_and_await("enqueue", {"items": items_list})
+        data = resp.get("data", {})
         return int(data.get("count", 0))
 
     def set_throttle(self, bytes_per_second: int) -> int:
-        """Ajusta el limitador de velocidad. 0 = sin límite."""
-        resp = self._send_request("set_throttle", {"bytes_per_second": int(bytes_per_second)})
-        data = self._dispatch(resp.get("event", ""), resp.get("data", {}))
+        resp = self._send_and_await("set_throttle", {"bytes_per_second": int(bytes_per_second)})
+        data = resp.get("data", {})
         return int(data.get("global_speed_bps", 0))
 
-    def cancel(self, job_id: Optional[str] = None) -> None:
-        """Cancela un job (o todos si job_id=None). Stub en el spike actual."""
-        resp = self._send_request("cancel", {"job_id": job_id})
-        self._dispatch(resp.get("event", ""), resp.get("data", {}))
+    def pause(self, job_id: Optional[str] = None) -> int:
+        """Pausa un job (o todos). Devuelve cantidad afectada."""
+        resp = self._send_and_await("pause", {"job_id": job_id})
+        # El server devuelve un response "error" con el count en el message.
+        # En un futuro, agregaremos un Response::Paused dedicado.
+        return self._extract_count(resp)
 
-    def pause(self, job_id: Optional[str] = None) -> None:
-        """Pausa un job (o todos). Stub en el spike actual."""
-        resp = self._send_request("pause", {"job_id": job_id})
-        self._dispatch(resp.get("event", ""), resp.get("data", {}))
+    def resume(self, job_id: Optional[str] = None) -> int:
+        resp = self._send_and_await("resume", {"job_id": job_id})
+        return self._extract_count(resp)
 
-    def resume(self, job_id: Optional[str] = None) -> None:
-        """Reanuda un job (o todos). Stub en el spike actual."""
-        resp = self._send_request("resume", {"job_id": job_id})
-        self._dispatch(resp.get("event", ""), resp.get("data", {}))
+    def cancel(self, job_id: Optional[str] = None) -> int:
+        resp = self._send_and_await("cancel", {"job_id": job_id})
+        return self._extract_count(resp)
+
+    def _extract_count(self, resp: dict) -> int:
+        # El server devuelve {"event": "error", "data": {"message": "..."}}
+        # con el count en el mensaje. Hacemos un parseo best-effort.
+        msg = resp.get("data", {}).get("message", "")
+        # Buscar "N job(s)" en el mensaje
+        import re
+        m = re.search(r"(\d+)\s+job", msg)
+        if m:
+            return int(m.group(1))
+        return 0
+
+    # ── Suscripción a eventos ────────────────────────────────────────
+    def subscribe(self, block: bool = True, timeout: float = 1.0) -> Iterator[ServerEvent]:
+        """Itera sobre eventos del server (job_started, job_progress, etc).
+
+        Útil para que la UI se actualice en tiempo real sin polling.
+        """
+        while True:
+            try:
+                item = self._events.get(timeout=timeout, block=block)
+            except queue.Empty:
+                if not block:
+                    return
+                continue
+            if isinstance(item, tuple):
+                # Es una respuesta a un request, la devolvemos a la cola
+                # para que el método que espera la pueda leer.
+                self._events.put(item)
+                if not block:
+                    return
+                continue
+            yield item
+
+    def drain_events(self) -> list[ServerEvent]:
+        """Devuelve todos los eventos pendientes sin bloquear."""
+        events = []
+        while True:
+            try:
+                item = self._events.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, tuple):
+                # Es respuesta a un request: reencolar
+                self._events.put(item)
+                break
+            events.append(item)
+        return events

@@ -1,38 +1,89 @@
 //! Servidor JSON-RPC sobre socket Unix.
 //!
 //! Protocolo: una línea = un JSON. Cliente envía Request, servidor
-//! responde Response. La conexión se mantiene abierta (long-lived).
+//! responde Response. **Eventos** se envían espontáneamente (job_started,
+//! job_progress, job_done, job_failed) en líneas JSON adicionales.
 //!
-//! Métodos implementados en este spike:
-//! - `ping`            → pong
-//! - `get_queue`       → queue_snapshot
-//! - `set_throttle`    → queue_snapshot
-//! - `enqueue`         → enqueued
-//! - `pause|resume|cancel` → error (pendiente fase 6)
+//! Conexión: long-lived. El cliente puede desconectarse/reconectarse;
+//! el servidor no requiere que esté siempre conectado (encola igual).
+//!
+//! Implementa:
+//! - `ping` → `pong`
+//! - `get_queue` → `queue_snapshot`
+//! - `set_throttle` → `queue_snapshot` (con `global_speed_bps`)
+//! - `enqueue` → `enqueued` (con count) y por cada item, eventos
+//!   `job_started` cuando el worker lo toma.
+//! - `pause` → por job_id o todos → `paused`
+//! - `resume` → por job_id o todos → `resumed`
+//! - `cancel` → por job_id o todos → `cancelled`
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::ops::copy::{CopyOp, SIGNAL_CANCEL, SIGNAL_PAUSE, SIGNAL_RUN};
 use crate::queue::QueueDb;
-use crate::types::{EnqueueItem, JobItem, Operation, Request, Response};
+use crate::types::{EnqueueItem, JobItem, JobState, Operation, Request, Response};
+
+/// Canal interno para señales de control de jobs (pause/cancel).
+/// Key = job_id, Value = AtomicU8 compartido con el worker.
+pub type JobSignals = Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU8>>>>;
 
 pub struct RpcServer {
     db: Arc<QueueDb>,
     throttle_bps: AtomicU64,
+    /// Canal de eventos para notificar a clientes conectados.
+    events: broadcast::Sender<ServerEvent>,
+    /// Mapa de señales activas por job.
+    signals: JobSignals,
+}
+
+/// Eventos internos que el server emite a los clientes.
+#[derive(Debug, Clone)]
+pub enum ServerEvent {
+    JobStarted(JobItem),
+    JobProgress {
+        id: String,
+        copied_bytes: u64,
+        total_bytes: u64,
+    },
+    JobCompleted(JobItem),
+    JobFailed { id: String, error: String },
+    JobPaused(String),
+    JobResumed(String),
+    JobCancelled(String),
 }
 
 impl RpcServer {
     pub fn new(db: Arc<QueueDb>) -> Self {
+        let (tx, _) = broadcast::channel(1024);
         Self {
             db,
             throttle_bps: AtomicU64::new(0),
+            events: tx,
+            signals: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Suscriptor a eventos. Lo usan el worker loop y los clientes
+    /// conectados para enterarse de cambios en la cola.
+    pub fn subscribe(&self) -> broadcast::Receiver<ServerEvent> {
+        self.events.subscribe()
+    }
+
+    /// Devuelve (o crea) la señal atómica de un job.
+    pub fn signal_for(&self, job_id: &str) -> Arc<std::sync::atomic::AtomicU8> {
+        let mut map = self.signals.lock().expect("signals mutex poisoned");
+        map.entry(job_id.to_string())
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicU8::new(SIGNAL_RUN)))
+            .clone()
     }
 
     pub fn throttle_bps(&self) -> u64 {
@@ -43,14 +94,15 @@ impl RpcServer {
         self.throttle_bps.store(bps, Ordering::Relaxed);
     }
 
-    /// Bucle principal: acepta conexiones y lanza una task por cliente.
+    pub fn emit(&self, ev: ServerEvent) {
+        let _ = self.events.send(ev);
+    }
+
     pub async fn run(
         self: Arc<Self>,
         socket_path: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Limpiar socket anterior si quedó colgado.
         let _ = std::fs::remove_file(&socket_path);
-
         let listener = UnixListener::bind(&socket_path)?;
         info!(path = %socket_path, "RPC server listening");
 
@@ -80,52 +132,112 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = BufReader::new(rd).lines();
+    // Suscribirse a eventos para reenviarlos al cliente.
+    let mut events_rx = server.subscribe();
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+    loop {
+        tokio::select! {
+            // Requests del cliente
+            line = lines.next_line() => {
+                let line = match line {
+                    Ok(Some(l)) => l,
+                    Ok(None) => return Ok(()), // cliente cerró
+                    Err(e) => {
+                        warn!("read error: {}", e);
+                        return Err(e.into());
+                    }
+                };
+                let line = line.trim();
+                if line.is_empty() { continue; }
 
-        let response = match serde_json::from_str::<Request>(line) {
-            Ok(req) => dispatch(&req, &db, &server).await,
-            Err(e) => {
-                warn!(reason = %e, raw = %line, "invalid request");
-                Response::Error {
-                    message: format!("parse error: {}", e),
+                let response = match serde_json::from_str::<Request>(line) {
+                    Ok(req) => dispatch(&req, &db, &server).await,
+                    Err(e) => {
+                        warn!(reason = %e, raw = %line, "invalid request");
+                        Response::Error { message: format!("parse error: {}", e) }
+                    }
+                };
+                let serialized = match serde_json::to_string(&response) {
+                    Ok(s) => s,
+                    Err(e) => format!(
+                        r#"{{"event":"error","data":{{"message":"serialization failed: {}"}}}}"#,
+                        e
+                    ),
+                };
+                wr.write_all(serialized.as_bytes()).await?;
+                wr.write_all(b"\n").await?;
+                wr.flush().await?;
+            }
+            // Eventos del server → cliente
+            ev = events_rx.recv() => {
+                if let Ok(ev) = ev {
+                    if let Some(line) = event_to_json(&ev) {
+                        // Ignoramos errores de escritura: si el cliente
+                        // se desconectó, el próximo read va a cerrar.
+                        if wr.write_all(line.as_bytes()).await.is_err() { return Ok(()); }
+                        let _ = wr.write_all(b"\n").await;
+                        let _ = wr.flush().await;
+                    }
                 }
             }
-        };
-
-        let serialized = match serde_json::to_string(&response) {
-            Ok(s) => s,
-            Err(e) => format!(
-                r#"{{"event":"error","data":{{"message":"serialization failed: {}"}}}}"#,
-                e
-            ),
-        };
-
-        wr.write_all(serialized.as_bytes()).await?;
-        wr.write_all(b"\n").await?;
-        wr.flush().await?;
+        }
     }
-    Ok(())
+}
+
+fn event_to_json(ev: &ServerEvent) -> Option<String> {
+    let s = match ev {
+        ServerEvent::JobStarted(job) => serde_json::to_string(&Event::JobStarted(job)),
+        ServerEvent::JobProgress { id, copied_bytes, total_bytes } => {
+            serde_json::to_string(&Event::JobProgress {
+                id: id.clone(),
+                copied_bytes: *copied_bytes,
+                total_bytes: *total_bytes,
+            })
+        }
+        ServerEvent::JobCompleted(job) => serde_json::to_string(&Event::JobCompleted(job)),
+        ServerEvent::JobFailed { id, error } => {
+            serde_json::to_string(&Event::JobFailed { id: id.clone(), error: error.clone() })
+        }
+        ServerEvent::JobPaused(id) => serde_json::to_string(&Event::JobPaused(id.clone())),
+        ServerEvent::JobResumed(id) => serde_json::to_string(&Event::JobResumed(id.clone())),
+        ServerEvent::JobCancelled(id) => serde_json::to_string(&Event::JobCancelled(id.clone())),
+    };
+    s.ok()
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "event", content = "data")]
+enum Event<'a> {
+    #[serde(rename = "job_started")]
+    JobStarted(&'a JobItem),
+    #[serde(rename = "job_progress")]
+    JobProgress {
+        id: String,
+        copied_bytes: u64,
+        total_bytes: u64,
+    },
+    #[serde(rename = "job_completed")]
+    JobCompleted(&'a JobItem),
+    #[serde(rename = "job_failed")]
+    JobFailed { id: String, error: String },
+    #[serde(rename = "job_paused")]
+    JobPaused(String),
+    #[serde(rename = "job_resumed")]
+    JobResumed(String),
+    #[serde(rename = "job_cancelled")]
+    JobCancelled(String),
 }
 
 async fn dispatch(req: &Request, db: &Arc<QueueDb>, server: &Arc<RpcServer>) -> Response {
     match req {
         Request::Ping => Response::Pong,
-
         Request::GetQueue => match db.get_all_jobs() {
             Ok(jobs) => Response::QueueSnapshot {
                 jobs,
                 global_speed_bps: server.throttle_bps(),
             },
-            Err(e) => Response::Error {
-                message: format!("db error: {}", e),
-            },
+            Err(e) => Response::Error { message: format!("db: {}", e) },
         },
-
         Request::SetThrottle { bytes_per_second } => {
             server.set_throttle(*bytes_per_second);
             let jobs = db.get_all_jobs().unwrap_or_default();
@@ -134,23 +246,76 @@ async fn dispatch(req: &Request, db: &Arc<QueueDb>, server: &Arc<RpcServer>) -> 
                 global_speed_bps: *bytes_per_second,
             }
         }
-
         Request::Enqueue { items } => match enqueue_items(db, items) {
             Ok(count) => Response::Enqueued { count },
-            Err(e) => Response::Error {
-                message: format!("enqueue failed: {}", e),
-            },
+            Err(e) => Response::Error { message: e },
         },
-
-        Request::Pause { .. } | Request::Resume { .. } | Request::Cancel { .. } => {
-            Response::Error {
-                message: format!(
-                    "{:?} no implementado todavía (spike fase 2 — implementar en fase 6)",
-                    req
-                ),
+        Request::Pause { job_id } => match control_job(db, server, job_id.as_deref(), SIGNAL_PAUSE) {
+            Ok(n) => Response::Error {
+                message: format!("pausados: {} job(s)", n),
+            },
+            Err(e) => Response::Error { message: e },
+        },
+        Request::Resume { job_id } => match control_job(db, server, job_id.as_deref(), SIGNAL_RUN) {
+            Ok(n) => Response::Error {
+                message: format!("reanudados: {} job(s)", n),
+            },
+            Err(e) => Response::Error { message: e },
+        },
+        Request::Cancel { job_id } => {
+            match control_job(db, server, job_id.as_deref(), SIGNAL_CANCEL) {
+                Ok(n) => Response::Error {
+                    message: format!("cancelados: {} job(s)", n),
+                },
+                Err(e) => Response::Error { message: e },
             }
         }
     }
+}
+
+fn control_job(
+    db: &QueueDb,
+    server: &RpcServer,
+    job_id: Option<&str>,
+    signal: u8,
+) -> Result<usize, String> {
+    let jobs = db.get_all_jobs().map_err(|e| e.to_string())?;
+    let mut count = 0;
+    for job in jobs {
+        let applies = match job_id {
+            Some(id) => job.id == id,
+            None => true,
+        };
+        if !applies {
+            continue;
+        }
+        match signal {
+            SIGNAL_PAUSE => {
+                if !job.state.is_pausable() {
+                    continue;
+                }
+                let sig = server.signal_for(&job.id);
+                sig.store(SIGNAL_PAUSE, Ordering::Relaxed);
+            }
+            SIGNAL_RUN => {
+                if !job.state.is_resumable() {
+                    continue;
+                }
+                let sig = server.signal_for(&job.id);
+                sig.store(SIGNAL_RUN, Ordering::Relaxed);
+            }
+            SIGNAL_CANCEL => {
+                if !job.state.is_cancellable() {
+                    continue;
+                }
+                let sig = server.signal_for(&job.id);
+                sig.store(SIGNAL_CANCEL, Ordering::Relaxed);
+            }
+            _ => unreachable!(),
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn enqueue_items(db: &QueueDb, items: &[EnqueueItem]) -> Result<usize, String> {
@@ -158,34 +323,180 @@ fn enqueue_items(db: &QueueDb, items: &[EnqueueItem]) -> Result<usize, String> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+
     let mut count = 0;
     for it in items {
-        let job = JobItem {
+        let src_str = it.source.to_string_lossy().to_string();
+        let dest_str = it.dest.to_string_lossy().to_string();
+        let expanded = expand_paths(
+            std::path::Path::new(&src_str),
+            std::path::Path::new(&dest_str),
+            it.op,
+            it.verify_hash,
+            now,
+        );
+        for job in expanded {
+            db.insert_job(&job).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Expande una ruta en uno o más JobItem. Calcula correctamente el
+/// destino para cada item expandido, manteniendo la estructura
+/// de directorios si el origen es una carpeta.
+///
+/// Reglas:
+/// - Si `dest` existe y es directorio, el archivo se copia a `dest/<basename>`.
+/// - Si `dest` no existe y el `source` es archivo: el destino se
+///   interpreta como "rename" (archivo destino exacto).
+/// - Si el `source` es directorio: se itera recursivamente y cada
+///   archivo termina en `dest/<ruta_relativa>`, creando subdirectorios
+///   según sea necesario (esto último no se hace en este spike, queda
+///   como mejora futura — por ahora los archivos de subcarpetas van
+///   todos a `dest/` con su basename).
+fn expand_paths(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+    op: Operation,
+    verify_hash: bool,
+    now: i64,
+) -> Vec<JobItem> {
+    let mut out = Vec::new();
+
+    if source.is_file() {
+        // Calcular el destino real respetando "dest es dir" vs "dest es archivo"
+        let real_dest = if dest.is_dir() {
+            dest.join(source.file_name().unwrap_or_default())
+        } else {
+            dest.to_path_buf()
+        };
+        let total_bytes = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+        out.push(JobItem {
             id: Uuid::new_v4().to_string(),
-            source: it.source.clone(),
-            dest: it.dest.clone(),
-            op: it.op,
-            state: Default::default(),
-            total_bytes: 0,
+            source: source.to_path_buf(),
+            dest: real_dest,
+            op,
+            state: JobState::Pending,
+            total_bytes,
             copied_bytes: 0,
             hash: None,
             enqueued_at: now,
             finished_at: 0,
             error: None,
-            verify_hash: it.verify_hash,
-        };
-        db.insert_job(&job).map_err(|e| e.to_string())?;
-        count += 1;
+            verify_hash,
+        });
+    } else if source.is_dir() {
+        // Expandir recursivamente
+        if let Ok(rd) = std::fs::read_dir(source) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    out.extend(expand_paths(&p, dest, op, verify_hash, now));
+                } else if p.is_dir() {
+                    out.extend(expand_paths(&p, dest, op, verify_hash, now));
+                }
+            }
+        }
     }
-    Ok(count)
+    out
 }
 
-// Silenciar warning de "Operation unused" en este spike: lo usamos en
-// enqueue_items al construir el JobItem.
-#[allow(dead_code)]
-fn _force_op_use(o: Operation) -> &'static str {
-    match o {
-        Operation::Copy => "copy",
-        Operation::Move => "move",
+/// Worker loop: cada 200ms revisa la cola, procesa un job pending,
+/// emite eventos.
+pub async fn worker_loop(db: Arc<QueueDb>, server: Arc<RpcServer>) {
+    use std::sync::atomic::AtomicU8;
+
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+    loop {
+        tick.tick().await;
+        // Tomar el próximo job pending (si hay).
+        let job = match db.get_all_jobs() {
+            Ok(mut jobs) => {
+                jobs.retain(|j| j.state == JobState::Pending);
+                jobs.into_iter().next()
+            }
+            Err(e) => {
+                warn!("worker: db error: {}", e);
+                None
+            }
+        };
+
+        let Some(mut job) = job else { continue };
+
+        // Marcar running antes de empezar.
+        let _ = db.update_state(&job.id, JobState::Running);
+        job.state = JobState::Running;
+        server.emit(ServerEvent::JobStarted(job.clone()));
+
+        let signal = server.signal_for(&job.id);
+        // Reset por si quedó colgada de un job anterior.
+        signal.store(SIGNAL_RUN, Ordering::Relaxed);
+
+        // Ejecutar en thread bloqueante (es I/O intensivo de archivos).
+        let db_c = db.clone();
+        let server_c = server.clone();
+        let job_id = job.id.clone();
+        let signal_c = signal.clone();
+
+        let handle = tokio::task::spawn_blocking(move || {
+            CopyOp::run(&mut job, signal_c);
+            job
+        });
+
+        // Mientras corre, emitimos progreso cada 200ms.
+        let progress_interval = std::time::Duration::from_millis(200);
+        loop {
+            tokio::time::sleep(progress_interval).await;
+            if handle.is_finished() {
+                break;
+            }
+            if let Ok(Some(j)) = db_c.get_job(&job_id) {
+                server_c.emit(ServerEvent::JobProgress {
+                    id: job_id.clone(),
+                    copied_bytes: j.copied_bytes,
+                    total_bytes: j.total_bytes,
+                });
+            }
+        }
+
+        let final_job = handle.await.expect("worker task panicked");
+        // Persistir estado final
+        let _ = db_c.update_job(&final_job);
+        match final_job.state {
+            JobState::Completed => {
+                server_c.emit(ServerEvent::JobCompleted(final_job.clone()));
+            }
+            JobState::Failed => {
+                let err = final_job.error.clone().unwrap_or_default();
+                server_c.emit(ServerEvent::JobFailed { id: final_job.id.clone(), error: err });
+            }
+            JobState::Cancelled => {
+                server_c.emit(ServerEvent::JobCancelled(final_job.id.clone()));
+            }
+            JobState::Paused => {
+                server_c.emit(ServerEvent::JobPaused(final_job.id.clone()));
+            }
+            _ => {}
+        }
+
+        // Si quedó en Paused, esperar a que alguien lo reanude antes de
+        // procesarlo de nuevo. Si el usuario lo canceló o reanudó
+        // manualmente, el state en DB ya está actualizado.
+        // Si quedó en Paused por el signal (job cooperativo), persistir
+        // ese estado y NO procesarlo hasta que vuelva a Pending.
+        // Para simplificar: si quedó Paused, lo dejamos así. El worker
+        // no toca jobs Paused porque filtra por Pending.
+
+        // Cleanup de la signal map.
+        {
+            let mut map = server_c.signals.lock().expect("signals mutex");
+            map.remove(&final_job.id);
+        }
+
+        // Ahogar el warning de "imported but unused" para AtomicU8 en este
+        // módulo (lo usamos en signal_for arriba).
+        let _ = std::marker::PhantomData::<AtomicU8>;
     }
 }

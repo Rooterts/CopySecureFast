@@ -44,7 +44,7 @@ pub enum Operation {
     Copy,
     Move,
 }
-
+/// Estado actual del job.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
@@ -54,6 +54,23 @@ pub enum JobState {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl JobState {
+    /// Estados en los que un job puede ser cancelado.
+    pub fn is_cancellable(&self) -> bool {
+        matches!(self, JobState::Pending | JobState::Running | JobState::Paused)
+    }
+
+    /// Estados en los que un job puede ser pausado.
+    pub fn is_pausable(&self) -> bool {
+        matches!(self, JobState::Pending | JobState::Running)
+    }
+
+    /// Estados en los que un job puede ser reanudado.
+    pub fn is_resumable(&self) -> bool {
+        matches!(self, JobState::Paused)
+    }
 }
 
 impl Default for JobState {

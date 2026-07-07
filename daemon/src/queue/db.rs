@@ -91,6 +91,16 @@ impl QueueDb {
     }
 
     /// Actualiza el estado y métricas de un job existente.
+    pub fn update_state(&self, id: &str, new_state: JobState) -> Result<bool, rusqlite::Error> {
+        // Devuelve true si actualizó una fila (es decir, el job existía y
+        // el cambio de estado estaba permitido).
+        let rows = self.lock().execute(
+            "UPDATE jobs SET state = ?1 WHERE id = ?2",
+            params![state_to_str(new_state), id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_job(&self, job: &JobItem) -> Result<(), rusqlite::Error> {
         self.lock().execute(
             "UPDATE jobs SET state=?1, total_bytes=?2, copied_bytes=?3,
